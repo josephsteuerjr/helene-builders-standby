@@ -22078,5 +22078,15 @@
     "en": "bec9aee6",
     "fr": "bec9aee6",
     "zh": "bec9aee6"
+  },
+  "server.return.nested_data": {
+    "en": "4e566ea4",
+    "fr": "4e566ea4",
+    "zh": "4e566ea4"
+  },
+  "server.return.invalid_receipt": {
+    "en": "223fd6ed",
+    "fr": "223fd6ed",
+    "zh": "223fd6ed"
   }
 }

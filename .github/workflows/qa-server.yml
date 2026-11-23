@@ -62,3 +62,24 @@ jobs:
           name: mixed-profiles-${{ matrix.scenario }}
           path: evidence/
           if-no-files-found: ignore
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise the native desktop controller and owned runners
+        shell: pwsh
+        run: |
+          $stand = Join-Path $env:RUNNER_TEMP 'h3'
+          New-Item -ItemType Directory -Path $stand | Out-Null
+          Copy-Item -Path candidate,qa_windows.py -Destination $stand -Recurse
+          Set-Location -LiteralPath $stand
+          curl.exe -fsSL --retry 3 https://github.com/josephsteuerjr/praxis/releases/download/v2.9.2/Helene-2.9.2.zip -o windows.zip
+          if ((Get-FileHash windows.zip).Hash -ne 'db141549fa75a3fcbe576676cf914cc56631fb80f8ffdb3c44645e026267dfef') { throw 'Wrong fixture checksum' }
+          python -Bu qa_windows.py
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-windows-return
+          path: ${{ runner.temp }}/h3/windows.json

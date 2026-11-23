@@ -4414,5 +4414,7 @@
   "server.return.private_choice": "Ces profils utilisent aussi ce code : {agents}. Par défaut, les modifications sont rapatriées dans une copie propre à cet agent.",
   "server.return.shared_choice": "Appliquer les modifications au code partagé par les profils indiqués (nécessite l’arrêt de tous les agents)",
   "server.return.resume": "Démarrer l’agent rapatrié",
-  "server.return.resumed": "L’agent rapatrié a démarré."
+  "server.return.resumed": "L’agent rapatrié a démarré.",
+  "server.return.nested_data": "Le dossier de code {path} contient les données ou les paramètres de l’agent. Choisissez un dossier de code distinct.",
+  "server.return.invalid_receipt": "Impossible de confirmer le retour de l’agent sélectionné."
 }

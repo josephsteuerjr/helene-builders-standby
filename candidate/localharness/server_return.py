@@ -334,7 +334,9 @@ def code_scope(config_path, program):
         roots = carry_scope.configured_roots(peer.config, _config(peer.config))
         if any(a.is_relative_to(b) or b.is_relative_to(a) for a in targets for b in roots.values()):
             shared[peer.id] = [str(path) for path in roots.values()]
-    binding = [str(Path(config_path).resolve()), [str(p) for p in targets], shared]
+    departure = transfer.saved_transfer(config_path)
+    binding = [str(Path(config_path).resolve()), departure.get('id'), departure.get('archive_sha'),
+               [str(p) for p in targets], shared]
     return {'agents': sorted(shared), 'binding': hashlib.sha256(json.dumps(binding, sort_keys=True).encode()).hexdigest(),
             'stopped': transfer.owner_stop.stopped()}
 
@@ -643,7 +645,7 @@ def cancel(config_path):
                            'скачанное сохранено.' if state['phase'] != 'started' else 'Возврат отменён.'}
 
 
-def release_pending(config_path):
+def release_pending(config_path, program=None):
     """Only the explicit resume of this returned profile clears its start hold."""
     with transfer.custody(config_path):
         cfg = _config(config_path)
@@ -651,7 +653,7 @@ def release_pending(config_path):
             return
         row = transfer.saved_transfer(config_path)
         if cfg.get('mode') != 'local' or not row.get('returned') or row.get('phase') != 'server-stopped' or row['id'] != cfg['return_pending']:
-            raise ReturnError('Invalid return receipt')
+            raise ReturnError(_caption(program or Path(config_path).parent, 'invalid_receipt'))
         del cfg['return_pending']
         transfer.carry._write_config(config_path, cfg)
 

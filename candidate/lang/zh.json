@@ -4414,5 +4414,7 @@
   "server.return.private_choice": "以下配置也使用这份代码：{agents}。默认将修改恢复到此智能体的独立副本。",
   "server.return.shared_choice": "将修改应用到所列配置的共享代码（需要先停止所有智能体）",
   "server.return.resume": "启动已返回的智能体",
-  "server.return.resumed": "已返回的智能体已启动。"
+  "server.return.resumed": "已返回的智能体已启动。",
+  "server.return.nested_data": "代码目录 {path} 包含智能体的数据或配置。请选择独立的代码目录。",
+  "server.return.invalid_receipt": "无法确认所选智能体已返回。"
 }

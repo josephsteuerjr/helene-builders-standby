@@ -373,6 +373,9 @@ def _plans(config: Path, *, session_host: bool,
     if not (session_host or desktop_roster):
         return plans
     occupied = {tree.resolve(strict=True) for tree, _ in plans.values()}
+    if BASE_ID not in plans:
+        # The local copy of a moved or paused profile still belongs to that profile.
+        occupied.add((base / (main.get("tree") or "data")).resolve())
     for agent in raisable(base):
         if agent.base:
             continue

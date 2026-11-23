@@ -91,7 +91,9 @@ def program_roots(config_path, cfg, program):
             roots[kind] = Path(program).resolve() / default
     for source in (roots['code'], roots['application']):
         if roots['data'].is_relative_to(source) or Path(config_path).resolve().is_relative_to(source):
-            raise ValueError('Agent data or configuration inside a programme source directory: ' + str(source))
+            from localharness import ui_language
+            raise ValueError(ui_language.text('server.return.nested_data', ui_language.for_root(Path(program)),
+                                              {'path': str(source)}))
     return roots
 
 
