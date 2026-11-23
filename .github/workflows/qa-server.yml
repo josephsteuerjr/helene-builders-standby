@@ -1,0 +1,72 @@
+name: Packaged server lifecycle
+on:
+  push:
+    branches: ['codex/server-lifecycle-292-2411']
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [roundtrip, fresh]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Prepare published fixtures on loopback
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/serverqa/ssh"
+          cp qa_server.py qa_fresh.py "$RUNNER_TEMP/serverqa"
+          cd "$RUNNER_TEMP/serverqa"
+          for version in 2.8.14 2.9.2; do
+            curl -fsSL --retry 4 "https://github.com/josephsteuerjr/praxis/releases/download/v$version/Helene-$version.zip" -o "Helene-$version.zip"
+          done
+          echo 'ce8d3ea54e2d235109248d516cdba54a705b45c96e4b55fb92e19617546aaa28  Helene-2.8.14.zip' | sha256sum -c
+          echo 'db141549fa75a3fcbe576676cf914cc56631fb80f8ffdb3c44645e026267dfef  Helene-2.9.2.zip' | sha256sum -c
+          python -m pip -q install paramiko psutil aiohttp requests cryptography
+          ssh-keygen -q -t ed25519 -N '' -f ssh/client
+          ssh-keygen -q -t ed25519 -N '' -f ssh/host
+          sudo mkdir -p /run/sshd /run/helene-ci
+          sudo install -o root -m 600 ssh/client.pub /run/helene-ci/authorized_keys
+          sudo /usr/sbin/sshd -f /dev/null -p 29690 -h "$PWD/ssh/host" -o ListenAddress=127.0.0.1 -o AuthorizedKeysFile=/run/helene-ci/authorized_keys -o UsePAM=yes -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no -o "PidFile=$PWD/ssh/probe.pid" -o 'Subsystem=sftp internal-sftp'
+      - name: Deploy, update and return
+        if: matrix.scenario == 'roundtrip'
+        shell: bash
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/serverqa"
+          for phase in move markers update back; do
+            echo "$phase"
+            python -Bu qa_server.py "$phase"
+          done
+      - name: Fresh installation
+        if: matrix.scenario == 'fresh'
+        shell: bash
+        run: |
+          cd "$RUNNER_TEMP/serverqa"
+          python -Bu qa_fresh.py
+      - name: Retain results and build error on failure
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p evidence
+          for file in fresh transfer markers update return; do
+            p="$RUNNER_TEMP/serverqa/$file.json"
+            if test -f "$p"; then cp "$p" evidence/; fi
+          done
+          for dir in /opt/helene-qa-300-2411-a9db /opt/helene-qa-300-2411-a9db-fresh; do
+            if sudo test -f "$dir/.install-last.log"; then sudo tail -40 "$dir/.install-last.log"; fi
+          done
+          docker ps -a --format '{{.Names}} {{.Status}}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: server-lifecycle-${{ matrix.scenario }}
+          path: evidence/
+          if-no-files-found: ignore
