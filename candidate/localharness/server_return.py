@@ -325,13 +325,17 @@ def _base(cc, home, meta, row, program, work):
 
 
 def code_scope(config_path, program):
-    local = carry_scope.configured_roots(config_path, _config(config_path))
+    local = carry_scope.program_roots(config_path, _config(config_path), program)
     targets = (local['code'], local['application'])
     shared = {}
     for peer in agents.roster(program):
         if peer.config.resolve() == Path(config_path).resolve():
             continue
-        roots = carry_scope.configured_roots(peer.config, _config(peer.config))
+        try:
+            cfg = _config(peer.config)
+        except FileNotFoundError:
+            cfg = {}  # The roster includes the main profile before its initial setup.
+        roots = carry_scope.program_roots(peer.config, cfg, program)
         if any(a.is_relative_to(b) or b.is_relative_to(a) for a in targets for b in roots.values()):
             shared[peer.id] = [str(path) for path in roots.values()]
     departure = transfer.saved_transfer(config_path)
@@ -347,27 +351,38 @@ def _caption(program, key):
 
 def private_program(local, home, program):
     """Publish the independent local merge targets together, retaining the server snapshot."""
+    # Junctions point at permanent locations on Windows. Stage at the final
+    # path and expose it to the runner only after copying Git metadata as well.
     target = home / 'local-program'
-    if not target.exists():
-        temporary = Path(tempfile.mkdtemp(prefix='local-program-', dir=home))
-        try:
-            for name, source in (('tree', local['code']), ('app', local['application'])):
-                inventory = carry_scope.inventory(source)
-                if inventory['errors'] or inventory['links'] or inventory['special']:
-                    raise ReturnError(_caption(program, 'private_copy_failed') + ' ' + str(source))
-                dest = temporary / name
-                shutil.copytree(source, dest, ignore=shutil.ignore_patterns('__pycache__', '.git'))
-                for git_record in inventory['git']:
-                    relative = Path(git_record['path']).parent
-                    if '.git' not in relative.parts:
-                        cc = transfer.carry._codecarry()
-                        git = cc._bundled_git(program) if cc else None
-                        carry_git.standalone(source / relative, dest / relative / '.git', git=git)
-            temporary.rename(target)
-        finally:
-            if temporary.exists():
-                shutil.rmtree(temporary)
-    return {'code': target / 'tree', 'application': target / 'app'}
+    attempt = 1
+    while target.exists() and not (target / '.program-ready.json').is_file():
+        attempt += 1
+        target = home / f'local-program-{attempt}'
+    destinations = {'code': target / 'roots/tree', 'application': target / 'roots/app'}
+    if target.exists():
+        return destinations
+    sources = {'tree': local['code'], 'app': local['application']}
+    repositories = []
+    exclusions = []
+    for name, source in sources.items():
+        inventory = carry_scope.inventory(source)
+        if inventory['errors'] or inventory['special']:
+            raise ReturnError(_caption(program, 'private_copy_failed') + ' ' + str(source))
+        for record in inventory['git']:
+            path = Path(record['path'])
+            if '.git' not in path.parent.parts:
+                repositories.append((name, path))
+                exclusions.append({'root': name, 'path': path.as_posix(), 'reason': 'standalone_git'})
+    with tempfile.TemporaryDirectory(prefix='private-copy-', dir=home) as work:
+        archive = Path(work) / 'program.zip'
+        receipt = carry_payload.create(archive, sources, exclusions=exclusions)
+        carry_payload.stage(archive, target, expected_sha256=receipt['sha256'])
+    cc = transfer.carry._codecarry()
+    for name, path in repositories:
+        carry_git.standalone(sources[name] / path.parent, target / 'roots' / name / path,
+                             git=cc._bundled_git(program) if cc else None)
+    _record(target / '.program-ready.json', {'sha256': receipt['sha256']})
+    return destinations
 
 
 def merge_code(config_path, program, row, home, meta, new_data, folder, *, destinations=None):
@@ -375,7 +390,7 @@ def merge_code(config_path, program, row, home, meta, new_data, folder, *, desti
     cc = transfer.carry._codecarry()
     roots = home / 'roots'
     cfg = _config(config_path)
-    local = destinations or carry_scope.configured_roots(config_path, cfg)
+    local = destinations or carry_scope.program_roots(config_path, cfg, program)
     targets = (('tree', roots / 'code', local['code']), ('app', roots / 'app', local['application']))
     if cc is None:
         return {'note': 'переносчика правок кода нет в этой установке; серверный код целиком в ' + str(roots)}
@@ -451,7 +466,7 @@ def activate(config_path, program, row, state, home, meta):
     row['return'] = state
     _save(config_path, row)
     local = _config(config_path)
-    roots = carry_scope.configured_roots(config_path, local)
+    roots = carry_scope.program_roots(config_path, local, program)
     scope = code_scope(config_path, program)
     choice = state.get('shared_code')
     if choice and (choice != scope['binding'] or not scope['stopped']):
@@ -477,12 +492,14 @@ def activate(config_path, program, row, state, home, meta):
     merged['tree'] = str(new_data)
     if private:
         merged['code'] = str(private['code'])
-        for key, default in (('app', 'app/deskapp.py'), ('runner', None)):
-            raw = local.get(key) or default
-            if raw:
-                path = (Path(config_path).parent / raw).resolve()
-                if path.is_relative_to(roots['application']):
-                    merged[key] = str(private['application'] / path.relative_to(roots['application']))
+        app = Path(local.get('app') or 'deskapp.py')
+        merged['app'] = str(private['application'] / app.name)
+        if local.get('runner'):
+            runner = (Path(config_path).parent / local['runner']).resolve()
+            for kind in ('application', 'code'):
+                if runner.is_relative_to(roots[kind]):
+                    merged['runner'] = str(private[kind] / runner.relative_to(roots[kind]))
+                    break
     if not scope['stopped']:
         merged['return_pending'] = row['id']
     # The window watched the server copy; the agent now lives here again.

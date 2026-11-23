@@ -75,7 +75,13 @@ raw={'host':'localhost','port':22,'login':'qa','deployment':deploy}
 row={'id':'1'*24,'phase':'ready','archive_sha':'cd'*32,'destination':['localhost',22,'qa'],'fingerprint':'SHA256:fixture','version':'2.9.2','deployment':deploy,
      'return':{'phase':'downloaded','id':rid,'projects':[],'remote':{'sha256':payload['sha256'],'bytes':archive.stat().st_size,'version':'2.9.2','archive':'/srv/snapshot.zip','exclusions':[]}}}
 dump(root/'data/memory/.state/server-transfer.json',row)
-owner=python_controller.Controller(root,lambda *args: None)
+from localharness import session_host
+host=session_host.Host(root)
+host_thread=threading.Thread(target=host.run,daemon=True)
+host_thread.start()
+wait(lambda:host.path.is_file() and session_host.read(host.path).get('state')=='running')
+owner=session_host.attach(root,lambda *args:None,'http://127.0.0.1:39401')
+generation=owner.descriptor['generation']
 def pid(agent):
     return owner.status()['agents'].get(agent,{}).get('pids',{}).get('runner')
 def manifests():
@@ -97,8 +103,16 @@ try:
     assert not pid('main') and pid(peer.id)==before
     result=command('resume-returned')
     assert result['ok'] and pid('main') and pid(peer.id)==before
+    assert owner.invoke('switch_agent',{'id':peer.id})['id']==peer.id
+    assert owner.channel()['agent_id']==peer.id
+    owner.close()
+    owner=session_host.attach(root,lambda *args:None,'http://127.0.0.1:39402',agent=peer.id)
+    assert owner.descriptor['generation']==generation and owner.channel()['agent_id']==peer.id
+    assert session_host.configured_origin(root/'helene.json','http://127.0.0.1:39402')
+    assert owner.invoke('switch_agent',{'id':'main'})['id']=='main'
+    assert owner.channel()['agent_id']=='main' and pid(peer.id)==before
     release.set();wait(lambda: manifests().get(runid,{}).get('status')=='done')
     assert len(manifests())==1 and pid(peer.id)==before
-    dump(d/'windows.json',dict(peer_pid_before=before,peer_pid_after=pid(peer.id),main_pid=pid('main'),completed_run=runid,profile_resume=True,shared_unchanged=True,transport='staged snapshot'))
+    dump(d/'windows.json',dict(peer_pid_before=before,peer_pid_after=pid(peer.id),main_pid=pid('main'),completed_run=runid,profile_resume=True,shared_unchanged=True,transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
 finally:
-    release.set();owner.close();server.shutdown()
+    release.set();owner.close();host.stop.set();host_thread.join(90);server.shutdown()

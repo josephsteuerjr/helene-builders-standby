@@ -66,7 +66,13 @@ with lab.st.connect(raw) as c:
         with ftp.open(remote) as f: c_cfg=json.loads(f.read())
         c_cfg.update(telegram={},model={**model,'model':'qa-main'},owner={'name':'QA','room':'Main'},phone={'enabled':False})
         with ftp.open(remote,'w') as f:f.write(json.dumps(c_cfg))
-owner=python_controller.Controller(root,lambda *args:None)
+from localharness import session_host
+host=session_host.Host(root)
+host_thread=threading.Thread(target=host.run,daemon=True)
+host_thread.start()
+wait(lambda:host.path.is_file() and session_host.read(host.path).get('state')=='running')
+owner=session_host.attach(root,lambda *args:None,'http://127.0.0.1:39401')
+generation=owner.descriptor['generation']
 def pid(agent):
     return owner.status()['agents'].get(agent,{}).get('pids',{}).get('runner')
 def manifests():
@@ -88,9 +94,17 @@ try:
     assert conf['return_pending'] and not pid('main') and pid(peer.id)==before and not release.is_set()
     outcome=command('resume-returned');assert outcome['ok'],outcome
     assert pid('main') and pid(peer.id)==before
+    assert owner.invoke('switch_agent',{'id':peer.id})['id']==peer.id
+    assert owner.channel()['agent_id']==peer.id
+    owner.close()
+    owner=session_host.attach(root,lambda *args:None,'http://127.0.0.1:39402',agent=peer.id)
+    assert owner.descriptor['generation']==generation and owner.channel()['agent_id']==peer.id
+    assert session_host.configured_origin(root/'helene.json','http://127.0.0.1:39402')
+    assert owner.invoke('switch_agent',{'id':'main'})['id']=='main'
+    assert owner.channel()['agent_id']=='main' and pid(peer.id)==before
     release.set()
     wait(lambda:manifests().get(current,{}).get('status')=='done')
     assert len(manifests())==1 and pid(peer.id)==before
-    lab.record('mixed',{'profile_code_at_server':True,'peer_pid_before':before,'peer_pid_after':pid(peer.id),'same_completed_run':current,'main_pid_after_explicit_resume':pid('main'),'private_code_active':True,'shared_code_untouched':True,'memory_and_git_preserved':True,'global_stop':False})
+    lab.record('mixed',{'profile_code_at_server':True,'peer_pid_before':before,'peer_pid_after':pid(peer.id),'same_completed_run':current,'main_pid_after_explicit_resume':pid('main'),'private_code_active':True,'shared_code_untouched':True,'memory_and_git_preserved':True,'global_stop':False,'reopened_same_session':True,'switched_both_profiles':True})
 finally:
-    release.set();owner.close();server.shutdown()
+    release.set();owner.close();host.stop.set();host_thread.join(90);server.shutdown()
