@@ -48,7 +48,7 @@ def control_path(root):
         if (tree.is_absolute() and descriptor.get('format') == FORMAT
                 and descriptor.get('program') == str(Path(root).resolve())
                 and descriptor.get('tree') == str(tree)
-                and descriptor.get('generation') == hint.get('generation')
+                and all(descriptor.get(key) == hint.get(key) for key in ('pid', 'birth', 'generation'))
                 and descriptor.get('state') in ('starting', 'running', 'owner-stopped')
                 and process_state(descriptor) in ('alive', 'unknown')):
             return previous
@@ -639,7 +639,7 @@ class Host:
             if self.migration_request is None:
                 from .program_state import directory
                 location = directory(self.root, 'desktop-supervisor') / 'session-location.json'
-                write(location, {'tree': str(self.control_tree), 'generation': self.descriptor['generation']})
+                write(location, {key: self.descriptor[key] for key in ('tree', 'pid', 'birth', 'generation')})
             server = threading.Thread(target=self.server.serve_forever, name='helene-session-control', daemon=True)
             server.start()
             if self.migration_request is None:

@@ -335,7 +335,7 @@ def code_scope(config_path, program):
             cfg = _config(peer.config)
         except FileNotFoundError:
             cfg = {}  # The roster includes the main profile before its initial setup.
-        roots = carry_scope.program_roots(peer.config, cfg, program)
+        roots = carry_scope.program_roots(peer.config, cfg, program, for_copy=False)
         if any(a.is_relative_to(b) or b.is_relative_to(a) for a in targets for b in roots.values()):
             shared[peer.id] = [str(path) for path in roots.values()]
     departure = transfer.saved_transfer(config_path)
@@ -492,7 +492,7 @@ def activate(config_path, program, row, state, home, meta):
     merged['tree'] = str(new_data)
     if private:
         merged['code'] = str(private['code'])
-        app = Path(local.get('app') or 'deskapp.py')
+        app = (Path(config_path).parent / (local.get('app') or 'app/deskapp.py')).resolve()
         merged['app'] = str(private['application'] / app.name)
         if local.get('runner'):
             runner = (Path(config_path).parent / local['runner']).resolve()
