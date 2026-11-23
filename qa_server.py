@@ -110,8 +110,11 @@ def back(raw_):
     stored=[str(p) for p in [*codepaths,*Path(result['home']).rglob('qa_server_only.py')] if p.is_file() and p.read_bytes()==b'QA_RETURN = True\n']
     assert stored and (data/'memory/server-only.txt').read_bytes()==b'Server-only memory.\n' and (data/'memory/before.txt').read_bytes()==b'Before the server move.\n'
     states=check(raw_,"docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' "+DEST['container']+' '+DEST['container']+'-updater').splitlines()
-    assert states==['false no','false no'],states
-    record('return',dict(phase=result['phase'],data=str(data),live_git=head,old_memory=True,new_memory=True,author_code=stored,containers=states))
+    assert len(states)==2 and all(state.split()[0]=='false' for state in states),states
+    assert check(raw_,'test -f '+DIR+'/.window-transfer-stopped && cat '+DIR+'/data/memory/server-only.txt')=='Server-only memory.'
+    active=Path(cfg.get('code','tree'));active=active if active.is_absolute() else CFG.parent/active
+    has_code=(active/'qa_server_only.py').is_file() and (active/'qa_server_only.py').read_bytes()==b'QA_RETURN = True\n'
+    record('return',dict(active_author_code=has_code,remote_fence=True,server_data_retained=True,phase=result['phase'],data=str(data),live_git=head,old_memory=True,new_memory=True,author_code=stored,containers=states))
 if __name__=='__main__':
     stage=sys.argv[1];setup();a=raw()
     if stage=='move':move(a)
