@@ -1,7 +1,7 @@
-name: Packaged server lifecycle
+name: Mixed local and remote profiles
 on:
   push:
-    branches: ['codex/server-lifecycle-292-2411']
+    branches: ['codex/mixed-profiles-300-2411']
 permissions:
   contents: read
 jobs:
@@ -22,14 +22,11 @@ jobs:
         run: |
           set -eu
           mkdir -p "$RUNNER_TEMP/serverqa/ssh"
-          cp qa_server.py qa_fresh.py "$RUNNER_TEMP/serverqa"
+          cp -R qa_server.py qa_prepare.py qa_mixed.py candidate "$RUNNER_TEMP/serverqa/"
           cd "$RUNNER_TEMP/serverqa"
-          for version in 2.8.14 2.9.2; do
-            curl -fsSL --retry 4 "https://github.com/josephsteuerjr/praxis/releases/download/v$version/Helene-$version.zip" -o "Helene-$version.zip"
-          done
-          echo 'ce8d3ea54e2d235109248d516cdba54a705b45c96e4b55fb92e19617546aaa28  Helene-2.8.14.zip' | sha256sum -c
-          echo 'db141549fa75a3fcbe576676cf914cc56631fb80f8ffdb3c44645e026267dfef  Helene-2.9.2.zip' | sha256sum -c
-          python -m pip -q install paramiko psutil aiohttp requests cryptography
+          curl -fsSL --retry 4 "https://github.com/josephsteuerjr/praxis/releases/download/v2.9.2/Helene-2.9.2-linux-x86_64.zip" -o linux.zip
+          echo 'aee3ff053dc1424b6fee243b2f6d6716a4be889871c082d3a5436457f30c57e7  linux.zip' | sha256sum -c
+          python qa_prepare.py
           ssh-keygen -q -t ed25519 -N '' -f ssh/client
           ssh-keygen -q -t ed25519 -N '' -f ssh/host
           sudo mkdir -p /run/sshd /run/helene-ci
@@ -41,22 +38,14 @@ jobs:
         run: |
           set -eu
           cd "$RUNNER_TEMP/serverqa"
-          for phase in move markers update back; do
-            echo "$phase"
-            python -Bu qa_server.py "$phase"
-          done
-      - name: Fresh installation
-        if: matrix.scenario == 'fresh'
-        shell: bash
-        run: |
-          cd "$RUNNER_TEMP/serverqa"
-          python -Bu qa_fresh.py
+          export PYTHONPATH="$PWD/desktop/app:$PWD/desktop/app/localharness"
+          timeout 17m desktop/runtime/bin/python3 -Bu qa_mixed.py
       - name: Retain results and build error on failure
         if: always()
         shell: bash
         run: |
           mkdir -p evidence
-          for file in fresh transfer markers update return; do
+          for file in mixed transfer markers; do
             p="$RUNNER_TEMP/serverqa/$file.json"
             if test -f "$p"; then cp "$p" evidence/; fi
           done
@@ -70,6 +59,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: server-lifecycle-${{ matrix.scenario }}
+          name: mixed-profiles-${{ matrix.scenario }}
           path: evidence/
           if-no-files-found: ignore

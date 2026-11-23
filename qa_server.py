@@ -7,7 +7,7 @@ from unittest.mock import patch
 D = Path(__file__).resolve().parent
 ROOT = D
 P = D/'desktop'
-OLD = D/'2.8.14'
+OLD = D/'2.9.2'
 CFG = P/'helene.json'
 DEST = {'directory':'/opt/helene-qa-300-2411-a9db','project':'helene-qa-300-2411-a9db','container':'helene-qa-300-2411-a9db','port':29783}
 DIR=DEST['directory']
@@ -29,10 +29,10 @@ def clean_extract(path,out):
             dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(z.read(x))
     (out/'extraction-ok').touch()
 def setup():
-    clean_extract(D/'Helene-2.8.14.zip',OLD)
+
     clean_extract(D/'Helene-2.9.2.zip',P)
     if not CFG.exists():
-        cfg={'mode':'local','tree':'data','code':'tree','port':29781,'app':'app/deskapp.py','runner':'app/localharness/runner.py','agent':{'name':'QA 300'},'model':{'base_url':'http://127.0.0.1:9','model':'','key':''},'telegram':{'owner_id':'123456','bot_token':'000000:synthetic_offline'},'relay':{'enabled':False},'voice':{'enabled':False,'speak':False},'phone':{'enabled':False},'installed':{'version':'2.8.14'},'setup_complete':True,'read_dotenv':False}
+        cfg={'mode':'local','tree':'data','code':'tree','port':29781,'app':'app/deskapp.py','runner':'app/localharness/runner.py','agent':{'name':'QA 300'},'model':{'base_url':'http://127.0.0.1:9','model':'','key':''},'telegram':{'owner_id':'123456','bot_token':'000000:synthetic_offline'},'relay':{'enabled':False},'voice':{'enabled':False,'speak':False},'phone':{'enabled':False},'installed':{'version':'2.9.2'},'setup_complete':True,'read_dotenv':False}
         dump(CFG,cfg)
         p=P/'data/memory/before.txt';p.parent.mkdir(parents=True);p.write_bytes(b'Before the server move.\n')
 setup()
@@ -73,12 +73,12 @@ def move(raw_):
                 print('channel readiness',route,type(e).__name__,flush=True)
                 raise
         with patch.object(st.owner_stop,'seed_file',return_value=stop),patch.object(st,'execute',execute),patch.object(st.remote_locator,'locate',return_value='http://127.0.0.1'),patch.object(st.remote_locator,'read',side_effect=read):
-            result=st.run(raw_,CFG,OLD)
+            result=st.run(raw_,CFG,P)
         facts=report_facts(proof(owner))
-    assert result['ok'] and result['stopped'] and facts['version']=='2.8.14'
+    assert result['ok'] and result['stopped'] and facts['version']=='2.9.2'
     cfg=json.loads(CFG.read_text(encoding='utf-8-sig'));cfg.update(mode='remote',base=result['base'],key=result['key'],server_locator=result['server_locator']);dump(CFG,cfg)
     assert check(raw_,'cat '+DIR+'/data/memory/before.txt')=='Before the server move.'
-    record('transfer',dict(**facts,phase=st.saved_transfer(CFG)['phase'],memory_equal=True,telegram_discovery='replaced by SSH to loopback',desktop_controller='2.9.2',deployed_program='2.8.14',stop_fixture=True))
+    record('transfer',dict(**facts,phase=st.saved_transfer(CFG)['phase'],memory_equal=True,telegram_discovery='replaced by SSH to loopback',desktop_controller='2.9.2',deployed_program='2.9.2',stop_fixture=True))
 def markers(raw_):
     from base64 import b64encode
     script="""from pathlib import Path
