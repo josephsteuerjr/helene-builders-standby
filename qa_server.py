@@ -42,7 +42,7 @@ def raw():
     blob=base64.b64decode((D/'ssh'/'host.pub').read_text().split()[1])
     pin='SHA256:'+base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
     return dict(host='127.0.0.1',login='root',port=29690,key_path=str(D/'ssh/client'),fingerprint=pin,confirmed_host=True,deployment=DEST)
-def http(client,endpoint,key):
+def channel_get(client,endpoint,key):
     conn=http.client.HTTPConnection('127.0.0.1',DEST['port'],timeout=8)
     conn.sock=client.get_transport().open_channel('direct-tcpip',('127.0.0.1',DEST['port']),('127.0.0.1',0))
     try:
@@ -51,7 +51,7 @@ def http(client,endpoint,key):
     finally: conn.close()
 def proof(c):
     key=st.execute(c,'cat '+DIR+'/data/.serverboot/desk-token')[1].strip()
-    return {k:http(c,'/api/'+k,key) for k in ('state','supervisor','panic')}
+    return {k:channel_get(c,'/api/'+k,key) for k in ('state','supervisor','panic')}
 def report_facts(f):
     return dict(version=f['state']['desk']['version'],supervisor=f['supervisor']['kind'],alive=f['supervisor']['alive'],stopped=f['panic']['stopped'])
 def check(raw_,cmd):
@@ -65,7 +65,13 @@ def move(raw_):
         command=command.replace('HELENE_AUTOMATIC_CONNECTION=1','HELENE_AUTOMATIC_CONNECTION=0')
         return original(c,command,*args,**kwargs)
     with st.connect(raw_) as owner:
-        def read(req):return http(owner,urlsplit(req.full_url).path,req.get_header('Authorization').split(' ',1)[1])
+        def read(req):
+            route=urlsplit(req.full_url).path
+            try:
+                return channel_get(owner,route,req.get_header('Authorization').split(' ',1)[1])
+            except Exception as e:
+                print('channel readiness',route,type(e).__name__,flush=True)
+                raise
         with patch.object(st.owner_stop,'seed_file',return_value=stop),patch.object(st,'execute',execute),patch.object(st.remote_locator,'locate',return_value='http://127.0.0.1'),patch.object(st.remote_locator,'read',side_effect=read):
             result=st.run(raw_,CFG,OLD)
         facts=report_facts(proof(owner))
