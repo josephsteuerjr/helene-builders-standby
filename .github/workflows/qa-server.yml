@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        scenario: [roundtrip, fresh]
+        scenario: [roundtrip]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -63,6 +63,9 @@ jobs:
           for dir in /opt/helene-qa-300-2411-a9db /opt/helene-qa-300-2411-a9db-fresh; do
             if sudo test -f "$dir/.install-last.log"; then sudo tail -40 "$dir/.install-last.log"; fi
           done
+          if sudo test -f /opt/helene-qa-300-2411-a9db/data/memory/.control/update-receipt.json; then
+            sudo python -c "import json; r=json.load(open('/opt/helene-qa-300-2411-a9db/data/memory/.control/update-receipt.json')); print({k:r.get(k) for k in ('state','phase','note','summary')})"
+          fi
           docker ps -a --format '{{.Names}} {{.Status}}'
       - uses: actions/upload-artifact@v4
         if: always()

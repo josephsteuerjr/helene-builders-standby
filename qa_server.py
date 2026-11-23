@@ -95,7 +95,8 @@ def back(raw_):
     import subprocess
     r=sr.scope(raw_,CFG,P)
     print('scope',r.keys(),flush=True)
-    result=sr.run(raw_,CFG,P)
+    with patch.object(st.owner_stop,'seed_file',return_value=D/'stand.stop'):
+        result=sr.run(raw_,CFG,P)
     cfg=json.loads(CFG.read_text(encoding='utf-8-sig'));data=Path(cfg['tree']);proj=data/'workspace/projects/roundtrip'
     head=subprocess.check_output(['git','-C',str(proj),'rev-parse','HEAD'],text=True).strip()
     assert cfg['mode']=='local' and head==json.loads((D/'markers.json').read_text())['project_head']
