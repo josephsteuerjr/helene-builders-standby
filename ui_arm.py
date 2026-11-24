@@ -11,7 +11,7 @@ compose=['docker','compose','-f','server/docker-compose.yml']
 def ctl(action):
     return json.loads(sp.check_output(['docker','exec','-u','0','nativearm','python','server/emergency_stop.py',action,'--tree','/opt/helene/data']))
 def api(path,body=None):
-    key=(root/'data/.serverboot/desk-token').read_text().strip()
+    key=sp.check_output(['docker','exec','nativearm','cat','/opt/helene/data/.serverboot/desk-token'],text=True,stderr=sp.DEVNULL).strip()
     req=urllib.request.Request('http://127.0.0.1:29783/api/'+path,data=None if body is None else json.dumps(body).encode(),headers={'Authorization':'Bearer '+key,'Content-Type':'application/json'})
     return json.load(urllib.request.urlopen(req,timeout=6))
 def wait(fn,limit=140):
@@ -28,6 +28,8 @@ def alive():
     return v.get('kind')=='serverboot' and all(any(r.get('id')==role and r.get('alive') for r in v['children']) for role in ('channel','runner'))
 try:
     sp.run([*compose,'up','-d','--build','helene'],cwd=root,env=env,check=True)
+    # A real boot error must be reported immediately and remain diagnosable.
+    print('native image',sp.check_output(['docker','image','inspect','nativearm-helene','--format','{{.Architecture}}'],text=True).strip(),flush=True)
     wait(alive)
     who=api('state')['desk']['version'];assert who=='2.9.2' and ctl('status')['stopped'] is False
     api('panic',{});wait(lambda:ctl('status')['stopped'])
@@ -36,5 +38,11 @@ try:
     assert ctl('resume')['stopped'] is False
     wait(alive)
     (out/'result.json').write_text(json.dumps(dict(arch=platform.machine(),server=who,stop_survived_container_restart=True,explicit_resume=True,channel_and_runner=True)))
+except BaseException:
+    print(sp.check_output(['docker','inspect','nativearm','--format','{{json .State}} {{json .Mounts}}'],text=True),flush=True)
+    logs=sp.run(['docker','logs','--tail','70','nativearm'],capture_output=True,text=True)
+    for line in (logs.stdout+logs.stderr).splitlines():
+        if not any(word in line.lower() for word in ('token','bearer','password','/api/','?key=')):print(line)
+    raise
 finally:
     sp.run([*compose,'down'],cwd=root,env=env,check=False)

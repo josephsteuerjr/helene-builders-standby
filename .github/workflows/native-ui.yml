@@ -10,13 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - {target: windows, runner: windows-2025, asset: 'Helene-2.9.2.zip'}
-          - {target: mac-arm, runner: macos-15, asset: 'Helene-2.9.2-macos-arm64.zip'}
-          - {target: mac-intel, runner: macos-26-intel, asset: 'Helene-2.9.2-macos-x86_64.zip'}
-          - {target: debian, runner: ubuntu-24.04, asset: 'Helene-2.9.2-linux-x86_64.zip'}
-          - {target: fedora, runner: ubuntu-24.04, asset: 'Helene-2.9.2-fedora-x86_64.zip'}
-          - {target: server-arm, runner: ubuntu-24.04-arm, asset: 'Helene-2.9.2-server-linux-arm64.zip'}
+        include: ${{ fromJSON(contains(github.event.head_commit.message, '[arm]') && '[{"target":"server-arm","runner":"ubuntu-24.04-arm","asset":"Helene-2.9.2-server-linux-arm64.zip"}]' || '[{"target":"windows","runner":"windows-2025","asset":"Helene-2.9.2.zip"},{"target":"mac-arm","runner":"macos-15","asset":"Helene-2.9.2-macos-arm64.zip"},{"target":"mac-intel","runner":"macos-26-intel","asset":"Helene-2.9.2-macos-x86_64.zip"},{"target":"debian","runner":"ubuntu-24.04","asset":"Helene-2.9.2-linux-x86_64.zip"},{"target":"fedora","runner":"ubuntu-24.04","asset":"Helene-2.9.2-fedora-x86_64.zip"},{"target":"server-arm","runner":"ubuntu-24.04-arm","asset":"Helene-2.9.2-server-linux-arm64.zip"}]') }}
     runs-on: ${{ matrix.runner }}
     name: ${{ matrix.target }}
     timeout-minutes: 28
