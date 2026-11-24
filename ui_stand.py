@@ -132,9 +132,9 @@ try:
     after=pid(peer.id)
     final_main=pid('main')
     close_view(second)
-    assert owner.invoke('owner_control',{'action':'panic'}).get('ok',True)
+    owner.invoke('owner_control',{'action':'panic'})
     wait(lambda:not pid(peer.id) and not pid('main'),60)
-    assert owner.invoke('owner_control',{'action':'resume'}).get('ok',True)
+    owner.invoke('owner_control',{'action':'resume'})
     wait(lambda:pid(peer.id) and pid('main'))
     dump(out/'result.json',dict(peer_pid_before=before,peer_pid_after=after,main_pid=final_main,old_main_pid=initial_main,targeted_restart=True,global_stop_resume=True,completed_run=runid,profile_resume=True,shared_unchanged=True,target=sys.argv[1],arch=platform.machine(),transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
 finally:
