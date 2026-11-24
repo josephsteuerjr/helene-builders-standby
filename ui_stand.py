@@ -135,7 +135,41 @@ try:
     observation('second','opened');observation('second','selected')
     assert session_host.read(session_host.control_path(root))['generation']==generation
     assert len(manifests())==1 and pid(peer.id)==before
+    linux=sys.platform.startswith('linux')
+    linux_receipt={}
+    if linux:
+        from localharness import session_exit
+        def managed_window():
+            for line in subprocess.check_output(['wmctrl','-lp'],text=True).splitlines():
+                fields=line.split(None,4)
+                if len(fields)==5 and fields[2]==str(second.pid) and fields[4]=='Hélène':
+                    return fields[0]
+        xid=wait(managed_window)
+        def iconic():
+            text=subprocess.check_output(['xprop','-id',xid,'WM_STATE','_NET_WM_STATE'],text=True)
+            return 'Iconic' in text and '_NET_WM_STATE_HIDDEN' in text and '_NET_WM_STATE_SKIP_TASKBAR' not in text
+        def restore():
+            subprocess.run(['wmctrl','-ia',xid],check=True)
+            wait(lambda:'Normal' in subprocess.check_output(['xprop','-id',xid,'WM_STATE'],text=True))
+            assert managed_window()==xid and second.poll() is None
+        def still_running():
+            assert pid(peer.id)==before and pid('main')==final_main_before
+            assert owner.status()['session']['generation']==generation
+            assert not session_exit.requested(root) and managed_window()==xid
+        final_main_before=pid('main')
+        (out/'minimize-active').touch()
+        wait(iconic);still_running();restore()
+        subprocess.run(['xdotool','key','alt+F4'],check=True)
+        wait(iconic);still_running()
+        linux_receipt=dict(xid=xid,window_pid=second.pid,first_close_iconic=True,
+                           alt_f4_iconic=True,listed_in_taskbar=True,session_generation_unchanged=True)
     release.set();wait(lambda: manifests().get(runid,{}).get('status')=='done')
+    if linux:
+        assert iconic()
+        still_running()
+        restore()
+        linux_receipt['completed_while_minimized']=runid
+        linux_receipt['restored_same_window']=True
     assert len(manifests())==1 and pid(peer.id)==before
     after=pid(peer.id)
     final_main=pid('main')
@@ -143,7 +177,7 @@ try:
     wait(lambda:not pid(peer.id) and not pid('main'),60)
     owner.invoke('owner_control',{'action':'resume'})
     wait(lambda:pid(peer.id) and pid('main'))
-    (out/'close-real').touch()
+    (out/('quit-explicit' if linux else 'close-real')).touch()
     def visible_win():
         import ctypes
         types=ctypes.wintypes
@@ -166,7 +200,7 @@ try:
     else:assert second.wait(timeout=60)==0
     if sys.platform.startswith('linux'):
         wait(lambda:session_host.process_state(owner.descriptor) in ('changed','absent'),60)
-        closed='last window exited session'
+        closed='minimized to taskbar; explicit Quit exited session'
     else:
         assert owner.status()['session']['generation']==generation
         closed='hidden in tray' if second.poll() is None else 'view detached'
@@ -176,7 +210,7 @@ try:
     from localharness import session_exit
     assert session_exit.requested(root)
     owner=None
-    dump(out/'result.json',dict(titlebar_close=closed,owner_exit_verified=True,peer_pid_before=before,peer_pid_after=after,main_pid=final_main,old_main_pid=initial_main,targeted_restart=True,global_stop_resume=True,completed_run=runid,profile_resume=True,shared_unchanged=True,target=sys.argv[1],arch=platform.machine(),transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
+    dump(out/'result.json',dict(**linux_receipt,titlebar_close=closed,owner_exit_verified=True,peer_pid_before=before,peer_pid_after=after,main_pid=final_main,old_main_pid=initial_main,targeted_restart=True,global_stop_resume=True,completed_run=runid,profile_resume=True,shared_unchanged=True,target=sys.argv[1],arch=platform.machine(),transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
 finally:
     release.set()
     for proc in windows:

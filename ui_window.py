@@ -54,6 +54,20 @@ def drive():
         else:switch('peer');switch('main')
         dump(phase+'-selected',{'final':'main','pid':os.getpid()})
         if phase=='second':
+            if sys.platform.startswith('linux'):
+                wait(lambda:(out/'minimize-active').is_file(),180)
+                label=ev("document.querySelector('button[data-win=close]').getAttribute('aria-label')")
+                assert label==ev("document.querySelector('button[data-win=minimize]').getAttribute('aria-label')")
+                ev("setTimeout(()=>document.querySelector('button[data-win=close]').click(),50);true")
+                wait(lambda:(out/'quit-explicit').is_file(),180)
+                ev("document.querySelector('button[data-view=settings]').click();true")
+                wait(lambda:ev("Boolean(document.querySelector('.settings-tab[data-group=app]'))"))
+                ev("document.querySelector('.settings-tab[data-group=app]').click();true")
+                wait(lambda:ev("Boolean(document.querySelector('[data-action=quit-application]')?.getClientRects().length)"))
+                ev("document.querySelector('[data-action=quit-application]').scrollIntoView({block:'center'});true")
+                dump('quit-control',{'label':ev("document.querySelector('[data-action=quit-application]').textContent"),'close_label':label,'screen_bytes':screenshot('explicit-quit')})
+                ev("setTimeout(()=>document.querySelector('[data-action=quit-application]').click(),50);true")
+                return
             wait(lambda:(out/'close-real').is_file(),180)
             assert ev("Boolean(document.querySelector('button[data-win=close]').getClientRects().length)")
             # Allow the JavaScript invocation to finish before its view is disposed.

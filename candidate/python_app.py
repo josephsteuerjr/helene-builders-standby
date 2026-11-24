@@ -1,0 +1,1106 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Hélène's Python desktop application, retaining the shipped window UI.
+
+Usage: runtime/python.exe app/python_app.py --root <owner directory>
+The native host is a replaceable OS integration organ, not the window runtime.
+Python/UI updates therefore need no Electron or Tauri rebuild.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import secrets
+import sys
+import threading
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from socketserver import TCPServer
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+
+def _ui_text(root, key, legacy, **values):
+    try:
+        from localharness.ui_language import text, for_root
+        return text(key,for_root(root),values)
+    except (ImportError,OSError,ValueError,KeyError,RuntimeError):
+        return legacy.format_map(values) if values else legacy
+
+
+def _ui_error(root,error):
+    try:
+        from localharness.ui_language import error_text
+        return error_text(error,root)
+    except ImportError:
+        return str(error)
+
+
+def startup_log(root):
+    try:
+        from localharness.program_state import directory
+        return directory(root,'logs')/'startup-error.log'
+    except (OSError,ValueError,ImportError):
+        return Path(root)/'startup-error.log'
+
+def recover_before_imports(argv):
+    """The startup consumer repairs an interrupted overlay before body imports."""
+    if '--panic' in argv:return False  # Stop never waits for update recovery
+    parser=argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--root',type=Path)
+    parser.add_argument('--migration',default='')
+    known,_rest=parser.parse_known_args(argv)
+    if known.root is None:return False
+    from localharness.python_source_updater import recover_startup
+    root=known.root.resolve()
+    if not recover_startup(root,known.migration):return False
+    from localharness.python_platform import desktop_argv
+    command=desktop_argv(root,argv)
+    os.execv(command[0],command)
+    return True
+
+
+def prepare_before_imports(argv):
+    parser=argparse.ArgumentParser(add_help=False)
+    parser.add_argument('--root',type=Path,default=Path(__file__).resolve().parents[1])
+    known,_rest=parser.parse_known_args(argv)
+    if '--panic' not in argv:
+        from localharness.source_admission import activate
+        activate(known.root)
+
+
+if __name__=='__main__':
+    try:
+        recover_before_imports(sys.argv[1:])
+        prepare_before_imports(sys.argv[1:])
+    except Exception as exc:
+        import traceback
+        detail=traceback.format_exc()
+        root=Path(__file__).resolve().parents[1]
+        if '--root' in sys.argv:
+            position=sys.argv.index('--root')+1
+            if position<len(sys.argv):root=Path(sys.argv[position]).resolve()
+        try:
+            with startup_log(root).open('a',encoding='utf-8') as output:output.write(detail+'\n')
+        except OSError:pass
+        print(detail,file=sys.stderr)
+        if os.name=='nt':
+            from localharness.bootstrap_ready import signal
+            signal(failed=True)
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None,_ui_error(root,exc),_ui_text(root,'native.app.startup_title','Hélène — startup failed'),0x10)
+        raise SystemExit(1)
+
+from localharness.python_controller import Controller
+from localharness.python_platform import desktop_identity
+from localharness.ui_language import NativeValueError, NativeRuntimeError, NativeFileNotFoundError
+
+
+class _LoopbackHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        TCPServer.server_bind(self)
+        self.server_name='localhost'
+        self.server_port=self.server_address[1]
+
+
+class Application:
+    def __init__(self, root: Path, ui: Path, host=None, program: Path | None = None):
+        self.root, self.ui, self.host = root, ui.resolve(), host
+        self.program = program or root
+        self.window = None
+        self.window_maximized = False
+        self.relaunch = False
+        self.restart_session = False
+        self.migration_wizard = False
+        self.migration_id = ''
+        self.confirm_lock = threading.Lock()
+        self.confirmed_ui = False
+        self.ui_ready = False
+        self.browser_mode = False
+        self.tray = None
+        self.start_in_tray = False
+        self.voice_keys = None
+        self.exiting = False
+        # Closing a view detaches it. Only an explicit application Exit owns
+        # the session lifetime; an update/relaunch retires this observer.
+        self.exit_session = False
+        self.session_exit_intent = True
+        self.token = secrets.token_urlsafe(32)
+        self.events: list[dict] = []
+        self.stopping = threading.Event()
+        self.lock = threading.Lock()
+        from localharness.inbox_wake import InboxWake
+        self.preference_wake = InboxWake(root)
+        self.preference_stamp = self._preference_signature()
+        self.preference_version = 0
+        self.channel = (host.channel() if isinstance(host, Controller) else
+                        self._channel(host.ready.result(timeout=60)["script"]) if host else {})
+        if host:
+            self.host.on_event = self.event
+        self.server = _LoopbackHTTPServer(("127.0.0.1", 0), self._handler())
+        self.server.daemon_threads = True
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        from localharness.program_state import window_control
+        self.control_file = window_control(self.root,os.getpid(),create=True)
+
+    def publish_control(self):
+        """Expose the existing authenticated exit surface only after UI readiness."""
+        value = {'schema': 1, 'pid': os.getpid(), 'root': str(self.root.resolve()),
+                 'origin': self.origin, 'token': self.token, 'ui_ready': self.ui_ready}
+        temporary = self.control_file.with_suffix('.tmp')
+        temporary.write_text(json.dumps(value), encoding='utf-8')
+        os.replace(temporary, self.control_file)
+
+    @staticmethod
+    def _channel(script):
+        prefix = "window.DESK_CONFIG_OVERRIDE = "
+        line = script.strip().splitlines()[0]
+        if not line.startswith(prefix) or not line.endswith(";"):
+            raise NativeValueError('channel_missing', 'Движок не передал канал окна')
+        return json.loads(line[len(prefix):-1])
+
+    def event(self, name, data):
+        if name=='session-exited':
+            if self.exiting:return
+            self.exiting=True;self.exit_session=False;self.stopping.set()
+            if self.window is not None:
+                # Return from the observer before UI cleanup joins it. This
+                # also closes hidden observers without browser timer polling.
+                threading.Thread(target=self.window.destroy,name='helene-observer-exit',daemon=True).start()
+            return
+        if name == 'program-restart':
+            # The owner asked from the MiniApp; this window is the addressed one.
+            if data.get('observer') and data.get('observer') == getattr(self.host, 'observer', None):
+                self.invoke('restart_self', {'full': True})
+            return
+        if name == "relaunch":
+            self.relaunch = True
+            name = "exit"
+        if name == "replace-window":
+            self.channel = self._channel(data["script"])
+        with self.lock:
+            self.events.append({"name": name, "data": data})
+
+    def invoke(self, command, args):
+        if not isinstance(command, str) or command.startswith("host_"):
+            raise NativeValueError('call_unavailable', 'Недоступный вызов оболочки')
+        from localharness import program_commands
+        # Same default as __init__ (program or root) for partially built instances.
+        shared = program_commands.invoke(self.root, getattr(self, 'program', self.root), command, args)
+        if shared is not program_commands.UNHANDLED:
+            return shared
+        if command == 'voice_shortcuts':
+            if self.browser_mode:return {'active':False,'error':'В браузере сочетание работает только внутри окна.'}
+            if self.voice_keys is None:
+                from localharness.voice_hotkeys import GlobalVoiceKeys
+                self.voice_keys=GlobalVoiceKeys(self)
+            return self.voice_keys.configure(args)
+        if command == 'voice_status':
+            if self.voice_keys:self.voice_keys.show(args)
+            return {'ok':True}
+        if command == 'python_ready':
+            result=self.confirm_ui()
+            from localharness.bootstrap_ready import signal
+            signal()
+            return result
+        if command == 'restore_upstream':
+            if args.get('confirmed') is not True:raise NativeValueError('restore_confirm', 'Подтверди возврат к upstream-коду')
+            from localharness import upstream_recovery
+            if upstream_recovery.modern(self.root):
+                if self.host is None:raise NativeRuntimeError('restore_session', 'Для восстановления открой действующий сеанс Hélène или новый целый архив.')
+                return self.host.invoke(command,args)
+            return upstream_recovery.launch(self.root)
+        if command == 'migration_wizard':
+            if not sys.platform.startswith('linux'):
+                raise NativeValueError('linux_migration', 'This offline migration wizard is available in the Linux application')
+            self.migration_wizard = True
+            self.relaunch = True
+            self.event('exit', {})
+            return None
+        if command == "restart_self":
+            self.restart_session = args.get('full') is True
+            if self.restart_session:
+                self.exit_session = True
+                self.session_exit_intent = False
+            self.relaunch = True
+            self.event("exit", {})
+            return None
+        if command == "component_install":
+            name=str(args.get('name',''))
+            if name == 'server-bridge':
+                # This built-in module only enables a private marker. It has
+                # no replaceable binary and must not retire the live session.
+                from localharness.server_bridge import install
+                return install()
+            if name == 'relay':
+                from localharness import standalone_relay
+                return standalone_relay.install(self.program,lambda value:self.event('package-progress',value))
+            if name == 'toolchain':raise NativeValueError('build_tools', 'Инструменты сборки больше не поставляются с Hélène')
+            if name in ('xtts','whisper','windows-mcp'):
+                if self.host is None:raise NativeRuntimeError('agent_missing', 'Select an agent before installing an optional component')
+                return self.host.invoke('component_install',{'name':name})
+            from localharness import app_components
+            if self.host is not None:
+                # Component replacement retires executable readers, unlike a
+                # window detach. Do not overwrite under a surviving session.
+                shutdown = getattr(self.host, 'shutdown', None)
+                if callable(shutdown):shutdown(owner_exit=False)
+                else:self.host.close()
+                self.host = None
+            return app_components.install(self.program, self.root, str(args.get("name", "")))
+        if command == "components_start":
+            if self.host is None:
+                from localharness.session_host import attach
+                host = attach(self.root, self.event, self.origin, browser_mode=self.browser_mode)
+                try:
+                    host.start()
+                    channel = host.channel()
+                except BaseException:
+                    host.close()
+                    raise
+                self.host, self.channel = host, channel
+            return {"ok": True}
+        if command == "python_window":
+            action = args.get("action")
+            if action == "exit":
+                self.exiting = True
+                if args.get('relaunch') is False:
+                    self.relaunch = False
+                restart = getattr(self, 'restart_session', False)
+                self.exit_session = restart or (not args.get('observer_only', False) and not self.relaunch)
+                self.session_exit_intent = not restart and args.get('owner_exit') is not False
+                if self.window is None:
+                    self.stopping.set()
+                else:
+                    self.window.destroy()
+                return None
+            if action == "close" and self.window is None:
+                self.stopping.set()
+            if action == "resize_edge":
+                resize_edge(self, args)
+                return None
+            if action == "begin_drag":
+                return begin_native_drag(self, args)
+            if action == "state":
+                return {"maximized": window_is_maximized(self)}
+            if self.window is not None:
+                if action == "minimize":
+                    self.window.minimize()
+                elif action == "maximize":
+                    if window_is_maximized(self):
+                        self.window.restore()
+                    else:
+                        try:
+                            fit_maximized_bounds(self)
+                        except Exception as error:
+                            self.event('window-error', {'error': str(error)})
+                        self.window.maximize()
+                elif action == "close" and self.tray is not None and not self.exiting:
+                    self.window.hide()
+                elif action in ("close", "exit"):
+                    self.window.destroy()
+            return None
+        if self.host is None:
+            raise NativeRuntimeError('components_first', 'Install the bundled components and start the application first')
+        return self.host.invoke(command, args)
+
+    def confirm_ui(self):
+        self.ui_ready=True
+        self.publish_control()
+        if sys.platform=='win32' and not getattr(self,'retirement_started',False):
+            from localharness.portable_retirement import start
+            start(self.root,self.host)
+            self.retirement_started=True
+        if not self.migration_id:
+            if sys.platform=='win32':
+                from localharness.login_migration import commit
+                commit(self.root)
+            return {'confirmed':False}
+        with self.confirm_lock:
+            if not self.confirmed_ui:
+                from localharness import app_migration, owner_stop
+                from localharness.package_notice import read, write
+                note=read(self.root/'python-migration.json')
+                if note.get('id')!=self.migration_id:raise NativeValueError('migration_identity', 'Migration confirmation identity changed')
+                if note.get('state')=='failed_before_retirement':return {'confirmed':False,'terminal':True}
+                try:
+                    proof=({'stopped':True,'root':str(self.root)} if owner_stop.stopped()
+                           else migration_proof(self.host,self.root,timeout=5))
+                    confirmed=app_migration.confirm_started(self.root,self.migration_id,proof=proof)
+                    if confirmed.get('state') not in ('new_app_started','completed','retirement_incomplete'):
+                        return {'confirmed':False,'terminal':True}
+                except Exception as exc:
+                    write(self.root/'migration-ready.json',{'id':self.migration_id,'state':'pending','error':str(exc)[:2000]})
+                    raise
+                write(self.root/'migration-ready.json',{'id':self.migration_id,'state':'confirmed'})
+                self.confirmed_ui=True
+        return {'confirmed':True,'migration_id':self.migration_id}
+
+    @staticmethod
+    def preference_key(key):
+        from localharness.window_preferences import preference_key
+        return preference_key(key)
+
+    def preferences(self):
+        from localharness.window_preferences import storage
+        return storage(self.root)
+
+    def _preference_signature(self):
+        try:
+            stat = (self.root / 'window-preferences.json').stat()
+            return stat.st_ino, stat.st_mtime_ns, stat.st_size
+        except OSError:
+            return None
+
+    def _preferences_changed(self):
+        # Observe the installation directory before checking the signature so
+        # an atomic save between two window polls still wakes the next poll.
+        if self.preference_wake.native and not self.preference_wake.wait(0) and self.preference_wake.native:
+            return False
+        stamp = self._preference_signature()
+        changed = stamp != self.preference_stamp
+        self.preference_stamp = stamp
+        return changed
+
+    def bridge(self):
+        from localharness.window_preferences import bootstrap
+        saved, seen = bootstrap(self.root)
+        return """window.DESK_CONFIG_OVERRIDE = %s;
+window.__HELENE__ = {shell:'python', platform:%s, minimizeOnClose:%s,
+ invoke: async (command,args={}) => {
+  const r = await fetch('/__python__/invoke', {method:'POST',headers:{
+   'Content-Type':'application/json','X-Helene-Window':%s},body:JSON.stringify({command,args})});
+  const v = await r.json(); if(!r.ok){const error=new Error(v.error);if(v.native_error)error.native_error=v.native_error;throw error;} return v.result;
+ }, win(action){this.invoke('python_window',{action}).catch(console.error)}};
+window.addEventListener('helene:ui-ready',async()=>{
+ const deadline=performance.now()+60000;
+ do {
+  try {await window.__HELENE__.invoke('python_ready');return;}
+  catch(error){console.error(error);if(performance.now()>=deadline)return;}
+  await new Promise(resolve=>setTimeout(resolve,1000));
+ }while(performance.now()<deadline);
+},{once:true});
+(function preferences(saved){
+ const store=window.localStorage, originalSet=Storage.prototype.setItem, originalRemove=Storage.prototype.removeItem;
+ for(const [key,value] of Object.entries(saved)) originalSet.call(store,key,value);
+ let pending=Promise.resolve(), seen=%s, revision=0, appearanceEpoch=0;
+ const unsaved=new Map();
+ const owned=['helene.look','frame.theme','frame.rail','frame.panel','frame.rail.width','frame.panel.width','helene.zoom'];
+ const fail=error=>{console.error(error);window.dispatchEvent(new CustomEvent('helene:preference-error',{detail:String(error)}));};
+ // A revision is acknowledged only after its canonical values reach this renderer.
+ const accept=result=>{
+  for(const key of owned){if(key in result.values)originalSet.call(store,key,result.values[key]);else originalRemove.call(store,key);}
+  seen=result.seen;window.dispatchEvent(new CustomEvent('helene:appearance',{detail:result}));
+ };
+ const persist=(key,value)=>{if(/^(frame[.]|helene[-.]|settings[.]|draft[.])/.test(key)) {
+  revision++;const appearance=owned.includes(key), issuedEpoch=appearanceEpoch;
+  pending=pending.then(async()=>{
+   if(appearance && issuedEpoch!==appearanceEpoch)return; // stale queued full-Look intent
+   try {
+    if(appearance && seen===null){
+     appearanceEpoch++;
+     const canonical=await window.__HELENE__.invoke('appearance_read');
+     appearanceEpoch++;accept(canonical); // also invalidate edits issued while recovery was awaiting I/O
+     fail('Appearance refreshed after an uncertain save; repeat your appearance edit.');return;
+    }
+    const result=await window.__HELENE__.invoke('window_preferences',{key,value,seen:appearance?seen:null});
+    if(!result.ok){
+     if(appearance){appearanceEpoch++;accept(result);}
+     unsaved.set(key,result.error);fail(result.error);return;
+    }
+    unsaved.delete(key);
+    if(appearance)accept(result); // unrelated draft/settings writes acknowledge no appearance
+   } catch(error) {
+    unsaved.set(key,error);
+    if(appearance){appearanceEpoch++;seen=null;}
+    fail(error);
+   }
+  });}};
+ window.__HELENE__.appearanceVersion=0;
+ window.__HELENE__.syncAppearance=(version=window.__HELENE__.appearanceVersion)=>{const at=revision;pending=pending.then(async()=>{
+   const result=await window.__HELENE__.invoke('appearance_read');if(at!==revision)return;
+   if(result.seen!==seen)accept(result);
+   window.__HELENE__.appearanceVersion=version;
+ }).catch(fail);return pending;};
+ Storage.prototype.setItem=function(key,value){originalSet.call(this,key,value);if(this===store)persist(String(key),String(value));};
+ Storage.prototype.removeItem=function(key){originalRemove.call(this,key);if(this===store)persist(String(key),null);};
+ // Production WebView2 disables native browser accelerators. Reload only the
+ // renderer, never the Python host; let queued draft/preferences writes settle.
+ window.__HELENE__.reloadCapability='safe-renderer-v2';
+ let reloading=false;
+ const requestReload=()=>{
+  if(reloading)return;
+  reloading=true;
+  (async()=>{
+   let saving;
+   do{saving=pending;await saving;}while(saving!==pending);
+   if(unsaved.size)throw new Error('Reload cancelled: unsaved preferences or drafts. Keep this window open and retry saving.');
+   window.location.reload();
+  })().catch(error=>{reloading=false;fail(error);});
+ };
+ window.__HELENE__.requestReload=requestReload;
+ window.addEventListener('keydown',event=>{
+  const reload=!event.altKey&&!event.shiftKey&&!event.isComposing&&(
+   (event.key==='F5'&&!event.ctrlKey&&!event.metaKey)||
+   ((event.ctrlKey||event.metaKey)&&(event.code==='KeyR'||event.key.toLowerCase()==='r')));
+  if(!reload)return;
+  event.preventDefault();
+  if(!event.repeat)requestReload();
+ },true);
+})(%s);
+(async function events(){try {
+ const r=await fetch('/__python__/events?appearance='+window.__HELENE__.appearanceVersion,{headers:{'X-Helene-Window':%s}});
+ if(r.ok) for(const e of await r.json()) {
+  if(e.name==='window-preferences') await window.__HELENE__.syncAppearance(e.data.version);
+  else if(e.name==='replace-window') location.replace('/');
+  else if(e.name==='retire-window') location.replace('/__python__/retired?id='+encodeURIComponent(e.data.id));
+  else if(e.name==='exit') window.__HELENE__.win('exit');
+  else window.dispatchEvent(new CustomEvent('helene:'+e.name,{detail:e.data}));
+ }
+} catch(e){console.error(e)} setTimeout(events,500)})();
+""" % (json.dumps(self.channel, ensure_ascii=False), json.dumps(desktop_identity()['platform']),
+       json.dumps(sys.platform.startswith('linux') and not self.browser_mode and self.host is not None),
+       json.dumps(self.token), json.dumps(seen), json.dumps(saved, ensure_ascii=False), json.dumps(self.token))
+
+    def _handler(self):
+        app = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass  # never log channel keys or file contents
+
+            def reply(self, code, value, content_type="application/json; charset=utf-8"):
+                data = json.dumps(value, ensure_ascii=False).encode() if isinstance(value, (dict, list)) else value
+                self.send_response(code)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(data)
+
+            def authorized(self):
+                return (self.headers.get("Host") == urlsplit(app.origin).netloc
+                        and self.headers.get("Origin", app.origin) == app.origin
+                        and secrets.compare_digest(self.headers.get("X-Helene-Window", ""), app.token))
+
+            def do_GET(self):
+                if self.headers.get("Host") != urlsplit(app.origin).netloc:
+                    return self.reply(403, {"error": "foreign host"})
+                path = urlsplit(self.path).path
+                if path == "/config.js":
+                    return self.reply(200, b"/* Python window configuration is injected before the UI. */", "application/javascript")
+                if path == "/__python__/retired":
+                    from urllib.parse import parse_qs
+                    retire_id = parse_qs(urlsplit(self.path).query).get("id", [""])[0]
+                    # A real document navigation retires the previous renderer's
+                    # JavaScript, sockets and credential-bearing globals before ACK.
+                    content = '<!doctype html><html><head><meta charset="utf-8"></head><body><script>' + app.bridge() + "\nwindow.__HELENE__.invoke('window_retire_ack',{retireId:" + json.dumps(retire_id) + "}).catch(console.error);</script></body></html>"
+                    return self.reply(200, content.encode(), "text/html; charset=utf-8")
+                if path == "/" and app.host is None:
+                    from localharness.components_page import page
+                    content = page(app.root, app.bridge())
+                    return self.reply(200, content.encode(), "text/html; charset=utf-8")
+                if path == "/__python__/events":
+                    if not self.authorized():
+                        return self.reply(403, {"error": "window token required"})
+                    from urllib.parse import parse_qs
+                    appearance = parse_qs(urlsplit(self.path).query).get('appearance', ['0'])[-1]
+                    with app.lock:
+                        items, app.events = app.events, []
+                        if app._preferences_changed():
+                            app.preference_version += 1
+                        if appearance != str(app.preference_version):
+                            items.append({'name':'window-preferences','data':{'version':app.preference_version}})
+                    return self.reply(200, items)
+                target = (app.ui / unquote(path).lstrip("/")).resolve()
+                if path == "/":
+                    target = app.ui / "index.html"
+                if not target.is_relative_to(app.ui) or not target.is_file():
+                    return self.reply(404, {"error": "not found"})
+                content = target.read_bytes()
+                kind = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                if target.name == "index.html":
+                    script = app.bridge().replace("</", "<\\/")
+                    content = content.replace(b"<head>", ("<head><script>" + script + "</script>").encode(), 1)
+                    kind = "text/html; charset=utf-8"
+                self.reply(200, content, kind)
+
+            def do_POST(self):
+                if urlsplit(self.path).path != "/__python__/invoke" or not self.authorized():
+                    return self.reply(403, {"error": "window token required"})
+                request={};args={}
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 90 * 1024 * 1024:
+                        raise ValueError("invalid window request size")
+                    request = json.loads(self.rfile.read(length))
+                    args = request.get("args", {})
+                    if not isinstance(args, dict):
+                        raise ValueError("command args must be an object")
+                    result = app.invoke(request["command"], args)
+                    self.reply(200, {"result": result})
+                except Exception as exc:
+                    try:
+                        from localharness.operation_diagnostics import record
+                        record(app.root,request.get('command') if isinstance(request,dict) else None,exc,values=args)
+                    except Exception:pass
+                    code=400 if isinstance(exc,(OSError,ValueError,KeyError,RuntimeError,TimeoutError)) else 500
+                    from localharness.ui_language import native_error
+                    payload={'error':str(exc),'error_type':type(exc).__name__}
+                    caption=native_error(exc)
+                    if caption is not None:payload['native_error']=caption
+                    self.reply(code,payload)
+
+        return Handler
+
+    def serve(self):
+        self.thread = threading.Thread(target=self.server.serve_forever, name="helene-window", daemon=True)
+        self.thread.start()
+        self.backup_thread = threading.Thread(target=self._backups, name="helene-essential-backup", daemon=True)
+        self.backup_thread.start()
+
+    def _backups(self):
+        from localharness import essential_backup
+        while not self.stopping.wait(1800):
+            try:
+                if essential_backup.due(self.root):
+                    essential_backup.snapshot(self.root, essential_backup.destination(self.root), "auto", self.stopping.is_set)
+            except (OSError, ValueError, InterruptedError) as exc:
+                self.event("backup-error", {"error": str(exc)})
+
+    def close(self):
+        self.stopping.set()
+        if getattr(self,'cocoa_js_bridge',None):self.cocoa_js_bridge.close()
+        failures=[]
+        def finish(action):
+            try:action()
+            except Exception as exc:failures.append(exc)
+        # UI/backup failures cannot leave the independent process owner running.
+        if self.host:
+            if self.exit_session and callable(getattr(self.host, 'shutdown', None)):
+                if getattr(self,'session_exit_intent',True):finish(self.host.shutdown)
+                else:finish(lambda:self.host.shutdown(owner_exit=False))
+            else:finish(self.host.close)
+        if self.voice_keys:finish(self.voice_keys.close)
+        if getattr(self,'backup_thread',None):finish(lambda:self.backup_thread.join(5))
+        if getattr(self,'thread',None):finish(self.server.shutdown)
+        finish(self.server.server_close)
+        if getattr(self,'thread',None):finish(lambda:self.thread.join(5))
+        if getattr(self,'preference_wake',None):finish(self.preference_wake.close)
+        finish(lambda:self.control_file.unlink(missing_ok=True))
+        if failures:
+            diagnostic='; '.join(str(exc) for exc in failures)
+            raise NativeRuntimeError('shutdown_incomplete', 'Application shutdown incomplete: '+diagnostic, detail=diagnostic) from failures[0]
+
+
+def window_geometry(screen):
+    frame = screen.frame if sys.platform == "win32" else None
+    left = frame.X if frame is not None else screen.x
+    top = frame.Y if frame is not None else screen.y
+    available_width = frame.Width if frame is not None else screen.width
+    available_height = frame.Height if frame is not None else screen.height
+    width = min(1360, max(1, available_width - 48))
+    height = min(880, max(1, available_height - 48))
+    return {"width": width, "height": height,
+            "x": left + (available_width - width) // 2,
+            "y": top + (available_height - height) // 2}
+
+
+RESIZE_EDGES = frozenset(("n", "s", "e", "w", "ne", "nw", "se", "sw"))
+MIN_WINDOW_SIZE = (640, 420)
+
+
+def window_is_maximized(app) -> bool:
+    """Whether the window itself is maximized right now.
+
+    On Windows the answer is the window's own WS_MAXIMIZE state (IsZoomed): pywebview's
+    maximized/restored events are only a mirror of WinForms' WindowState changes. Elsewhere,
+    and before the native handle is known, the event mirror is all there is.
+    """
+    if getattr(app, "window", None) is None:
+        return False
+    handle = getattr(app, "window_handle", 0)
+    if sys.platform == "win32" and handle:
+        import ctypes
+        return bool(ctypes.windll.user32.IsZoomed(ctypes.c_void_p(handle)))
+    return bool(getattr(app, "window_maximized", False))
+
+
+def fit_maximized_bounds(app):
+    """Maximize onto the work area of the monitor the window is on now.
+
+    A frameless WinForms window would cover the taskbar, so MaximizedBounds names the work
+    area. WM_GETMINMAXINFO takes that position relative to the monitor, not the virtual
+    screen; 2.8.2 set it once at start from the absolute WorkingArea, which is right only
+    on a primary monitor whose work area starts at 0,0. Recomputed before each maximize.
+    """
+    if sys.platform != "win32" or getattr(app, "window", None) is None:
+        return
+    from System import Action
+    from System.Drawing import Rectangle
+    from System.Windows.Forms import Screen
+    native = app.window.native
+
+    def apply():
+        screen = Screen.FromHandle(native.Handle)
+        work, monitor = screen.WorkingArea, screen.Bounds
+        native.MaximizedBounds = Rectangle(work.X - monitor.X, work.Y - monitor.Y,
+                                           work.Width, work.Height)
+        app.window_handle = int(native.Handle.ToInt64())
+
+    native.Invoke(Action(apply))
+
+
+def guard_maximized_move(app):
+    """A header drag must not slide a maximized window off its work area.
+
+    pywebview's drag region moves the window with SetWindowPos whatever its state, so a
+    drag on the header of a maximized window left it "maximized" but shifted, with gaps
+    at the screen edges. While maximized the drag is ignored; the maximize button, a
+    double click on the header or Win+Down restore it.
+    """
+    window = app.window
+    original = window.move
+
+    def move(x, y):
+        if window_is_maximized(app):
+            return None
+        return original(x, y)
+
+    window.move = move
+
+
+def resize_edge(app, args):
+    """Resize the frameless window from one edge, keeping the opposite side fixed.
+
+    pywebview's frameless WinForms/Qt window has no native resize border; the renderer's
+    handles (ui-kit/window/native-resize.ts) send the requested outer size in logical
+    pixels. A maximized or absent window is left as it is.
+    """
+    edge, width, height = args.get("edge"), args.get("width"), args.get("height")
+    if (edge not in RESIZE_EDGES or type(width) is not int or type(height) is not int
+            or not 0 < width <= 32768 or not 0 < height <= 32768):
+        return False  # only our renderer sends this; a malformed request changes nothing
+    if app.window is None or window_is_maximized(app):
+        return False
+    from webview.window import FixPoint
+    fix = ((FixPoint.SOUTH if "n" in edge else FixPoint.NORTH)
+           | (FixPoint.EAST if "w" in edge else FixPoint.WEST))
+    app.window.resize(max(MIN_WINDOW_SIZE[0], width), max(MIN_WINDOW_SIZE[1], height), fix)
+    return True
+
+
+# The header's drag area, shared with ui-kit/window/main.ts.
+HEADER_DRAG_SELECTOR = '#chrome, .chrome-drag, .rail-sign'
+# Matches nothing: pywebview's renderer drag is off where the system loop moves the window.
+NATIVE_DRAG_OFF = '[data-helene-renderer-drag]'
+# WM_NCLBUTTONDOWN hit-test codes: the system's own move loop (caption) and size loops (edges).
+NATIVE_DRAG_HIT = {"move": 2, "w": 10, "e": 11, "n": 12, "nw": 13, "ne": 14, "s": 15, "sw": 16, "se": 17}
+
+
+def begin_native_drag(app, args):
+    """Hand a header or edge drag on Windows to the system's own move/size loop.
+
+    pywebview moved the frameless window from the renderer: every mousemove went renderer ->
+    Python -> SetWindowPos, so the window trailed the cursor (Tim, 17.11: "окно не успевает
+    за движением курсора") and each step stalled WebView2's browser thread (50-77 ms measured
+    on the owner's 2.8.6 window). As in a titled window, a press on the caption or an edge now
+    starts Windows' modal move/size loop on the window's own thread. A maximized window stays
+    put, as in 2.8.3. Other platforms keep the renderer's drag (returns False).
+    """
+    kind = args.get("edge", "move")
+    if sys.platform != "win32" or not isinstance(kind, str) or kind not in NATIVE_DRAG_HIT:
+        return False
+    handle = getattr(app, "window_handle", 0)
+    if getattr(app, "window", None) is None or not handle or window_is_maximized(app):
+        return False
+    import ctypes
+    from ctypes import wintypes
+    from System import Action
+    user32 = ctypes.windll.user32
+    hit = NATIVE_DRAG_HIT[kind]
+
+    def start():
+        point = wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        # The press began in WebView2's child window; its input queue is attached to this
+        # thread's, so releasing capture here frees the mouse for the system loop.
+        user32.ReleaseCapture()
+        user32.PostMessageW(wintypes.HWND(handle), 0x00A1, wintypes.WPARAM(hit),
+                            wintypes.LPARAM((point.x & 0xFFFF) | ((point.y & 0xFFFF) << 16)))
+
+    # Posted, not sent: the bridge request returns while the loop runs on the window thread.
+    app.window.native.BeginInvoke(Action(start))
+    return True
+
+
+def linux_window_closing(app):
+    """Keep the desktop window in the taskbar until an explicit exit or relaunch."""
+    if app.host is None or app.exiting or app.relaunch:
+        return True
+    app.window.minimize()
+    return False  # pywebview cancels the native close event.
+
+
+def bind_window_state(app):
+    def shown():
+        if sys.platform == "win32":
+            try:
+                fit_maximized_bounds(app)
+                set_window_icon(app)
+            except Exception as error:
+                app.event('window-error', {'error': str(error)})
+            try:
+                from python_tray import install
+                install(app)
+            except Exception as error:
+                app.event('tray-error', {'error': str(error)})
+            # A hidden application must remain reachable if the notification
+            # icon cannot be created. Successful automatic starts stay hidden.
+            if app.start_in_tray and app.tray is None:
+                app.window.show()
+        app.publish_control()
+
+    def maximized():
+        app.window_maximized = True
+
+    def restored():
+        app.window_maximized = False
+
+    app.window.events.maximized += maximized
+    app.window.events.restored += restored
+    app.window.events.shown += shown
+    guard_maximized_move(app)
+    if sys.platform.startswith('linux'):
+        app.window.events.closing += lambda:linux_window_closing(app)
+
+
+def set_window_icon(app):
+    if sys.platform!='win32':return
+    from System import Action
+    from System.Drawing import Icon,Size
+    path=app.program/'app/resources/python-app.ico'
+    if not path.is_file():return
+    def install():
+        app._window_icon=Icon(str(path),Size(256,256))
+        app.window.native.Icon=app._window_icon
+    app.window.native.Invoke(Action(install))
+
+
+def bind_native_reload(app):
+    """Intercept WebView2 accelerators without enabling unsafe browser reload.
+
+    pywebview's loaded/shown events run off the UI thread. Install and execute
+    on the WinForms UI thread; never wait for JavaScript inside an accelerator
+    callback (WebView2 blocks renderer execution until that callback returns).
+    The HTTP-injected bridge owns persistence and is recreated each navigation.
+    """
+    if sys.platform != 'win32':
+        return
+
+    def loaded():
+        from System import Action
+        from System.Windows.Forms import Control, Keys
+        from System.Reflection import BindingFlags
+        form = app.window.native
+
+        def install():
+            if getattr(app, '_native_reload_bound', False):
+                return
+            view = form.browser.webview
+            if view.CoreWebView2 is None:
+                return  # loaded will retry once initialization completes
+
+            def matches(key, modifiers):
+                return ((key == 116 and modifiers == getattr(Keys, 'None')) or
+                        (key == 82 and modifiers == Keys.Control))
+
+            def request():
+                # Always defer past the native input callback. Missing bridge is
+                # a no-op, NOT CoreWebView2.Reload(): never bypass draft safety.
+                form.BeginInvoke(Action(lambda: view.CoreWebView2.ExecuteScriptAsync(
+                    "window.__HELENE__?.requestReload?.();")))
+
+            def accelerator(sender, event):
+                if str(event.KeyEventKind) not in ('KeyDown', 'SystemKeyDown'):
+                    return
+                if not matches(event.VirtualKey, Control.ModifierKeys):
+                    return
+                event.Handled = True
+                if not event.PhysicalKeyStatus.WasKeyDown:
+                    request()
+
+            def form_key(sender, event):
+                # Fallback when native chrome, rather than renderer, has focus.
+                if view.ContainsFocus or not matches(int(event.KeyCode), event.Modifiers):
+                    return
+                event.Handled = True
+                event.SuppressKeyPress = True
+                request()
+
+            # The bundled WebView2 WinForms SDK exposes no public controller
+            # property. Resolve its verified backing field; do not modify the
+            # vendored pywebview or turn on all browser accelerators.
+            field = view.GetType().GetField('_coreWebView2Controller',
+                                           BindingFlags.Instance | BindingFlags.NonPublic)
+            if field is None:
+                raise RuntimeError('Unsupported WebView2 SDK: reload controller field missing')
+            controller = field.GetValue(view)
+            controller.AcceleratorKeyPressed += accelerator
+            form.KeyPreview = True
+            form.KeyDown += form_key
+            app._native_reload_bound = (accelerator, form_key)
+
+        form.Invoke(Action(install))
+
+    app.window.events.loaded += loaded
+
+
+def migration_proof(host, root, timeout=60):
+    import time
+    from localharness import agents
+    deadline=time.monotonic()+timeout
+    primary=agents.find(root, agents.BASE_ID)
+    proof = host.readiness(timeout=max(.2,deadline-time.monotonic()), require_runner=True,agent=primary)
+    proof['agents'] = [({k:v for k,v in proof.items() if k!='agents'} if agent.id==primary.id else
+                       host.readiness(timeout=max(.2,deadline-time.monotonic()), require_runner=True, agent=agent))
+                       for agent in agents.raisable(root)]
+    return proof
+
+
+def _main(argv=None):
+    from localharness import bootstrap_ready
+    bootstrap_ready.attach()  # do not leak the one-shot event into descendants
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--program", type=Path)
+    parser.add_argument('--session-job',default='',help=argparse.SUPPRESS)
+    parser.add_argument('--session-tree',type=Path,help=argparse.SUPPRESS)
+    parser.add_argument("--agent", default="")
+    parser.add_argument("--panic", action="store_true", help="latch owner Stop without starting the application")
+    parser.add_argument("--notify", action="store_true", help="show the emergency-stop result")
+    parser.add_argument("--migration", default="", help="confirm this prepared migration after the real window loads")
+    parser.add_argument('--migration-wizard', action='store_true', help='open the offline profile migration wizard before starting any agent')
+    parser.add_argument("--browser", action="store_true", help="open the same Python-owned UI in the system browser")
+    parser.add_argument("--launch-intent", choices=("manual", "automatic"), default="manual")
+    parser.add_argument('--setup-old',default='')
+    parser.add_argument('--setup-target',default='')
+    parser.add_argument('--setup-source-mode',choices=('clean',),default='clean')
+    parser.add_argument('--setup-force-extensions',action='store_true')
+    args = parser.parse_args(arguments)
+    if args.panic:
+        if sys.platform=='win32':
+            from localharness.first_start import Places
+            os.environ['HELENE_USER_DATA']=str(Places.current().data)
+        from localharness import owner_stop
+        owner_stop.latch_client('shortcut', 'owner emergency stop')
+        bootstrap_ready.signal()
+        if args.notify and os.name == 'nt':
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, _ui_text(args.root,'native.app.emergency_requested','Emergency Stop requested. Automatic starts remain paused.'), 'Hélène', 0)
+        return 0
+    os.environ['PYTHONNOUSERSITE']='1'
+    if sys.platform.startswith('linux'):
+        from localharness.linux_desktop import configure
+        configure()
+    root = args.root.resolve()
+    program = (args.program or root).resolve()
+    from localharness import owner_stop
+    if args.launch_intent == "automatic" and owner_stop.stopped():
+        bootstrap_ready.signal()
+        return 0
+    if args.session_tree is not None and not args.session_job:
+        raise NativeValueError('session_admission', 'A selected session tree requires an admitted migration job')
+    if not args.session_job and program != root:
+        raise NativeValueError('root_mismatch', 'Program and configuration root must currently match; agent data may live elsewhere via absolute tree')
+    pending_entry=root/'python-migration.json'
+    recovery_entry=(pending_entry.is_file() and json.loads(pending_entry.read_text(encoding='utf-8')).get('state')
+                    not in ('completed','new_app_started','retirement_incomplete'))
+    from localharness import clean_startup
+    clean_pending = None if args.session_job else clean_startup.pending(root, args.migration)
+    if clean_pending is not None:
+        args.migration = clean_pending['note']['id']
+    if (sys.platform in ('darwin','linux') and not (args.session_job or args.migration or args.browser or args.migration_wizard or recovery_entry)
+            and (root/'python-app.json').is_file()
+            and __import__('localharness.python_platform',fromlist=['target']).target(root) in (('macos-arm64','macos-x86_64') if sys.platform=='darwin' else ('linux-x86_64',))):
+        from localharness import posix_first_start as first
+        places=first.Places.current(root)
+        if not first.ready(root,places) or not first.agent_exists(places.data):
+            from first_start_window import main as first_window
+            return first_window(root,places=places,flow=first)
+        changed=first.handover(root,places=places)
+        first.ensure_config(root,places=places,refresh_profile=changed)
+        os.environ['HELENE_USER_DATA']=str(places.data)
+    if sys.platform=='win32':
+        from localharness.first_start import ready as first_start_ready,Places
+        if first_start_ready(root):os.environ['HELENE_USER_DATA']=str(Places.current().data)
+        from localharness.program_state import tidy_program
+        tidy_program(program)
+    if args.session_job:
+        from localharness.migration_job import observer_program
+        observer_program(root,program,args.session_job,tree=args.session_tree)
+    if not args.migration and not args.browser and not args.session_job:
+        from localharness import portable_start
+        from localharness.first_start import ready as first_start_ready
+        prepared=first_start_ready(root) if sys.platform=='win32' else False
+        incomplete=root/'python-migration.json'
+        needs_migration=incomplete.exists() and json.loads(incomplete.read_text(encoding='utf-8')).get('state') not in ('completed','new_app_started','retirement_incomplete')
+        if not prepared and (args.migration_wizard or needs_migration or not (root/'helene.json').exists()):
+            from helene_setup import main as migration_window
+            setup_args=['--root',str(root),'--source-mode',args.setup_source_mode]
+            if args.setup_old:setup_args+=['--old',args.setup_old]
+            if args.setup_target:setup_args+=['--target',args.setup_target]
+            if args.setup_force_extensions:setup_args+=['--force-extensions']
+            return migration_window(setup_args)
+        if sys.platform=='win32':portable_start.initialize(root)
+    ui = program / "app" / "static"
+    if not (ui / "index.html").is_file():
+        raise NativeFileNotFoundError('window_assets', f"Нет сборки окна: {ui}", path=str(ui))
+    pending=root/'python-migration.json'
+    interrupted=pending.is_file() and json.loads(pending.read_text(encoding='utf-8')).get('state')=='preserving'
+    from localharness.essential_backup import load
+    fresh=(root/'helene.json').is_file() and load(root/'helene.json').get('setup_complete') is False and not pending.exists()
+    if sys.platform.startswith('linux') and (args.migration_wizard or interrupted or (fresh and not args.browser)):
+        from localharness.migration_wizard import run
+        if not run(root):return 0
+    elif interrupted:
+        raise NativeRuntimeError('interrupted_migration', 'Interrupted profile copy: resume migration before starting the application')
+    # A fresh/interrupted migrator has not yet selected a complete profile.
+    # Require its ordinary recovery entry first; running the app still requires
+    # the unchanged exact data-pointer/identity checks.
+    from contextlib import nullcontext
+    try:
+        with (nullcontext(False) if args.session_job else clean_startup.handoff(
+                root, args.migration, automatic=args.launch_intent == 'automatic')) as launch_locked:
+            if (root/'helene.json').is_file() and not args.session_job:
+                from localharness.portable_profile import bind_program
+                bind_program(root)
+            if pending.is_file() and not args.migration:
+                migrated=json.loads(pending.read_text(encoding='utf-8'))
+                if migrated.get('state')=='prepared':args.migration=migrated['id']
+            app = Application(root, ui, None, program)
+            app.migration_id=args.migration
+            app.session_job=args.session_job
+            app.browser_mode=args.browser
+            from localharness.session_host import attach,attach_migration
+            host = (attach_migration(root,program,args.session_job,app.event,app.origin,args.agent,
+                                    browser_mode=args.browser,tree=args.session_tree) if args.session_job else
+                    attach(root, app.event, app.origin, args.agent, browser_mode=args.browser,
+                           _launch_locked=launch_locked))
+    except clean_startup.Deferred as exc:
+        # The existing installation retains work/Stop intent. A prepared folder
+        # can be opened again after that boundary without a startup-error modal.
+        print(str(exc), file=sys.stderr)
+        bootstrap_ready.signal()
+        return 0
+    try:
+        if not args.session_job:host.start()
+        from localharness import owner_stop
+        if not owner_stop.stopped() and not args.session_job:
+            host.readiness(timeout=30)
+        app.channel = host.channel()
+        app.host = host
+    except BaseException:
+        if host:
+            host.close()
+        raise
+    app.serve()
+    print('HELENE_WINDOW_ORIGIN', app.origin, flush=True)
+    try:
+        if args.browser:
+            import webbrowser
+            app.publish_control()
+            webbrowser.open(app.origin)
+            app.stopping.wait()
+        else:
+            import webview
+            app.start_in_tray = (args.launch_intent == 'automatic' and
+                                 sys.platform == 'win32' and not app.migration_id)
+            # On Windows the renderer hands header drags to the system move loop
+            # (begin_native_drag); pywebview's own renderer drag must not also move the window.
+            webview.settings['DRAG_REGION_SELECTOR'] = (NATIVE_DRAG_OFF if sys.platform == 'win32'
+                                                        else HEADER_DRAG_SELECTOR)
+            webview.settings['DRAG_REGION_DIRECT_TARGET_ONLY'] = True
+            geometry = window_geometry(webview.screens[0])
+            app.window = webview.create_window("Hélène", app.origin, **geometry,
+                                               # The system size loop (begin_native_drag) honours
+                                               # the form's minimum, as resize_edge clamps it.
+                                               min_size=(min(MIN_WINDOW_SIZE[0], geometry["width"]),
+                                                         min(MIN_WINDOW_SIZE[1], geometry["height"])),
+                                               frameless=True, easy_drag=False, text_select=True,
+                                               background_color="#1d1914", hidden=app.start_in_tray)
+            if sys.platform=='darwin':
+                from localharness.cocoa_js_bridge import install
+                install(app)
+            bind_window_state(app)
+            bind_native_reload(app)
+            # The shared renderer's python_ready is the sole confirmation
+            # writer for native and browser windows alike.
+            icon=program/('app/resources/python-app.png' if sys.platform.startswith('linux') else 'app/resources/python-app.ico')
+            from localharness.program_state import directory
+            webview.start(gui='qt' if sys.platform.startswith('linux') else None,
+                          private_mode=False,storage_path=str(directory(root,'webview')),icon=str(icon) if icon.is_file() else None)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        app.close()
+    if app.relaunch:
+        # Relaunch is an explicit action in the application. The login-only
+        # intent must not hide the window again after its owner opened it.
+        previous = iter(arguments)
+        arguments = []
+        for argument in previous:
+            if argument == '--launch-intent':
+                next(previous, None)
+            elif argument != '--migration-wizard' and not argument.startswith('--launch-intent='):
+                arguments.append(argument)
+        arguments.extend(['--launch-intent', 'manual'])
+        if app.migration_wizard:arguments.append('--migration-wizard')
+        from localharness.python_platform import desktop_argv
+        command=desktop_argv(root,arguments)
+        os.execv(command[0],command)
+    return 0
+
+
+def main(argv=None):
+    # Console code pages may not represent the product name or a path in an
+    # error. Reporting/help must not turn into a startup failure and GUI alert.
+    # Keep the caller's encoding; only unrepresentable characters are escaped.
+    for stream in (sys.stdout, sys.stderr):
+        if callable(getattr(stream, "reconfigure", None)):
+            stream.reconfigure(errors="backslashreplace")
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return _main(arguments)
+    except Exception as exc:
+        import traceback
+        root = Path(__file__).resolve().parents[1]
+        if "--root" in arguments:
+            position = arguments.index("--root") + 1
+            if position < len(arguments):
+                root = Path(arguments[position]).resolve()
+        log = startup_log(root)
+        detail = "".join(traceback.format_exception(exc))
+        try:
+            with log.open("a", encoding="utf-8") as output:
+                output.write(detail + "\n")
+            message = _ui_text(root,'native.app.startup_log','Hélène could not start.\n\n{error}\n\nDetails: {path}',error=_ui_error(root,exc),path=str(log))
+        except OSError as log_error:
+            message = _ui_text(root,'native.app.startup_log_unavailable','Hélène could not start.\n\n{error}\n\nStartup log unavailable: {detail}',error=_ui_error(root,exc),detail=str(log_error))
+        print(detail, file=sys.stderr)
+        if os.name == "nt":
+            from localharness.bootstrap_ready import signal
+            signal(failed=True)
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, message, _ui_text(root,'native.app.startup_title','Hélène — startup failed'), 0x10)
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.run(["osascript", "-e", 'on run argv\ndisplay alert (item 1 of argv) message (item 2 of argv) as critical\nend run', _ui_text(root,'native.app.startup_title','Hélène — startup failed'), message], check=False)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
