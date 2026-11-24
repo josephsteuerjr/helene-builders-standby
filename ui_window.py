@@ -62,11 +62,33 @@ def drive():
                 wait(lambda:(out/'quit-explicit').is_file(),180)
                 ev("document.querySelector('button[data-view=settings]').click();true")
                 wait(lambda:ev("Boolean(document.querySelector('.settings-tab[data-group=app]'))"))
-                ev("document.querySelector('.settings-tab[data-group=app]').click();true")
-                wait(lambda:ev("Boolean(document.querySelector('[data-action=quit-application]')?.getClientRects().length)"))
-                ev("document.querySelector('[data-action=quit-application]').scrollIntoView({block:'center'});true")
-                dump('quit-control',{'label':ev("document.querySelector('[data-action=quit-application]').textContent"),'close_label':label,'screen_bytes':screenshot('explicit-quit')})
-                ev("setTimeout(()=>document.querySelector('[data-action=quit-application]').click(),50);true")
+                def quit_position():
+                    return ev("""(() => {
+                      const tab=document.querySelector('.settings-tab[data-group=app]');
+                      if(!tab)return false;
+                      if(tab.getAttribute('aria-selected')!=='true'){tab.click();return false;}
+                      const quit=document.querySelector('[data-action=quit-application]');
+                      if(!quit)return false;
+                      quit.scrollIntoView({behavior:'instant',block:'center'});
+                      const b=quit.getBoundingClientRect(),x=b.left+b.width/2,y=b.top+b.height/2;
+                      if(!quit.contains(document.elementFromPoint(x,y)))return false;
+                      return [Math.round(x*devicePixelRatio),Math.round(y*devicePixelRatio)];
+                    })()""")
+                pos=wait(quit_position)
+                # Wait for Qt to present this stable, hit-testable position to the X server.
+                for _ in range(15):
+                    time.sleep(.22)
+                    current=quit_position()
+                    if current==pos and current:break
+                    pos=current
+                else:raise AssertionError('Quit control did not settle')
+                xid=next(line.split()[0] for line in subprocess.check_output(['wmctrl','-lp'],text=True).splitlines()
+                         if len(line.split(None,4))==5 and line.split(None,4)[2]==str(os.getpid()) and line.endswith('Hélène'))
+                subprocess.run(['xdotool','mousemove','--sync','--window',xid,*map(str,pos)],check=True)
+                time.sleep(.35)
+                assert quit_position()==pos
+                dump('quit-control',{'label':ev("document.querySelector('[data-action=quit-application]').textContent"),'close_label':label,'screen_bytes':screenshot('explicit-quit'),'hit_test':pos,'xid':xid})
+                subprocess.run(['xdotool','click','1'],check=True)
                 return
             wait(lambda:(out/'close-real').is_file(),180)
             assert ev("Boolean(document.querySelector('button[data-win=close]').getClientRects().length)")
