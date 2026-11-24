@@ -151,6 +151,7 @@ try:
         def restore():
             subprocess.run(['wmctrl','-ia',xid],check=True)
             wait(lambda:'Normal' in subprocess.check_output(['xprop','-id',xid,'WM_STATE'],text=True))
+            wait(lambda:int(subprocess.check_output(['xdotool','getactivewindow']))==int(xid,16))
             assert managed_window()==xid and second.poll() is None
         def still_running():
             assert pid(peer.id)==before and pid('main')==final_main_before
@@ -159,10 +160,12 @@ try:
         final_main_before=pid('main')
         (out/'minimize-active').touch()
         wait(iconic);still_running();restore()
-        subprocess.run(['xdotool','key','alt+F4'],check=True)
-        wait(iconic);still_running()
+        for i in range(3):
+            subprocess.run(['xdotool','key','--clearmodifiers','alt+F4'],check=True)
+            wait(iconic);still_running()
+            if i<2:restore()
         linux_receipt=dict(xid=xid,window_pid=second.pid,first_close_iconic=True,
-                           alt_f4_iconic=True,listed_in_taskbar=True,session_generation_unchanged=True)
+                           alt_f4_iconic=True,alt_f4_repeats=3,listed_in_taskbar=True,session_generation_unchanged=True)
     release.set();wait(lambda: manifests().get(runid,{}).get('status')=='done')
     if linux:
         assert iconic()
