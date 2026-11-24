@@ -101,7 +101,15 @@ try:
     observation('first','opened')
     owner=session_host.attach(root,lambda *args:None)
     generation=owner.descriptor['generation']
-    assert entered.wait(130),str(owner.error)
+    if not entered.wait(25):
+        st=owner.status().get('agents',{}).get(peer.id,{})
+        print('Peer before model', {k:st.get(k) for k in ('pids','roles','problems','startup')},flush=True)
+        for log in peer.tree.glob('*.log'):
+            lines=log.read_text(encoding='utf8',errors='replace')[-6500:].splitlines()
+            safe=[line for line in lines if not any(term in line.lower() for term in ('bearer','token','password','api_key','api-key','secret='))]
+            (out/('peer-'+log.name)).write_text('\n'.join(safe),encoding='utf8')
+        if not entered.wait(80):
+            raise AssertionError('Peer did not enter the local provider')
     before=pid(peer.id); active=wait(manifests)
     assert before and len(active)==1 and not pid('main')
     runid=next(iter(active))
