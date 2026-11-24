@@ -139,12 +139,44 @@ try:
     assert len(manifests())==1 and pid(peer.id)==before
     after=pid(peer.id)
     final_main=pid('main')
-    close_view(second)
     owner.invoke('owner_control',{'action':'panic'})
     wait(lambda:not pid(peer.id) and not pid('main'),60)
     owner.invoke('owner_control',{'action':'resume'})
     wait(lambda:pid(peer.id) and pid('main'))
-    dump(out/'result.json',dict(peer_pid_before=before,peer_pid_after=after,main_pid=final_main,old_main_pid=initial_main,targeted_restart=True,global_stop_resume=True,completed_run=runid,profile_resume=True,shared_unchanged=True,target=sys.argv[1],arch=platform.machine(),transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
+    (out/'close-real').touch()
+    def visible_win():
+        import ctypes
+        types=ctypes.wintypes
+        user=ctypes.windll.user32
+        shown=[]
+        @ctypes.WINFUNCTYPE(types.BOOL,types.HWND,types.LPARAM)
+        def inspect(hwnd,unused):
+            pid=types.DWORD()
+            user.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
+            if pid.value==second.pid and user.IsWindowVisible(hwnd):
+                title=ctypes.create_unicode_buffer(256)
+                user.GetWindowTextW(hwnd,title,256)
+                if title.value=='Hélène':shown.append(hwnd)
+            return True
+        user.EnumWindows(inspect,0)
+        return bool(shown)
+    if os.name=='nt':
+        import ctypes.wintypes
+        wait(lambda:not visible_win(),45)
+    else:assert second.wait(timeout=60)==0
+    if sys.platform.startswith('linux'):
+        wait(lambda:session_host.process_state(owner.descriptor) in ('changed','absent'),60)
+        closed='last window exited session'
+    else:
+        assert owner.status()['session']['generation']==generation
+        closed='hidden in tray' if second.poll() is None else 'view detached'
+        if second.poll() is None:close_view(second)
+        owner.shutdown(owner_exit=True)
+        wait(lambda:session_host.process_state(owner.descriptor) in ('changed','absent'),60)
+    from localharness import session_exit
+    assert session_exit.requested(root)
+    owner=None
+    dump(out/'result.json',dict(titlebar_close=closed,owner_exit_verified=True,peer_pid_before=before,peer_pid_after=after,main_pid=final_main,old_main_pid=initial_main,targeted_restart=True,global_stop_resume=True,completed_run=runid,profile_resume=True,shared_unchanged=True,target=sys.argv[1],arch=platform.machine(),transport='staged snapshot',reopened_same_session=True,switched_both_profiles=True))
 finally:
     release.set()
     for proc in windows:

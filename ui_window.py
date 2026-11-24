@@ -53,6 +53,12 @@ def drive():
         if phase=='first':wait(lambda:(out/'main-ready').is_file(),210);switch('main')
         else:switch('peer');switch('main')
         dump(phase+'-selected',{'final':'main','pid':os.getpid()})
+        if phase=='second':
+            wait(lambda:(out/'close-real').is_file(),180)
+            assert ev("Boolean(document.querySelector('button[data-win=close]').getClientRects().length)")
+            # Allow the JavaScript invocation to finish before its view is disposed.
+            ev("setTimeout(()=>document.querySelector('button[data-win=close]').click(),50);true")
+
     except BaseException:
         try:
             dump(phase+'-error',{'error':traceback.format_exc(),'body':ev("(document.body?.innerText||'').slice(0,1000)"),'title':ev('document.title')})

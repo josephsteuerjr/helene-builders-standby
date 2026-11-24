@@ -43,6 +43,10 @@ except BaseException:
     logs=sp.run(['docker','logs','--tail','70','nativearm'],capture_output=True,text=True)
     for line in (logs.stdout+logs.stderr).splitlines():
         if not any(word in line.lower() for word in ('token','bearer','password','/api/','?key=')):print(line)
+    for name in ('runner.log','deskapp.log'):
+        res=sp.run(['docker','exec','-u','0','nativearm','tail','-30','/opt/helene/data/'+name],capture_output=True,text=True)
+        for line in res.stdout.splitlines():
+            if not any(term in line.lower() for term in ('token','bearer','api_key','password','?key=')):print(line)
     raise
 finally:
     sp.run([*compose,'down'],cwd=root,env=env,check=False)
