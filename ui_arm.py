@@ -39,25 +39,35 @@ def wait(fn,limit=140):
         except (OSError,ValueError,sp.CalledProcessError) as e:last=type(e).__name__
         time.sleep(.8)
     raise AssertionError('Timed out '+last)
-def alive():
+def alive(since=0):
     v=api('supervisor')
     roles={r['id']:r for r in v.get('children',[]) if r.get('alive')}
     if v.get('kind')!='serverboot' or not {'channel','runner'}<=roles.keys():return False
     receipt=sp.run(['docker','exec','-u','0','nativearm','cat','/opt/helene/data/memory/.control/desk_inbox/.reader.json'],capture_output=True,text=True)
     if receipt.returncode:return False
     reader=json.loads(receipt.stdout)
-    return reader['pid'] if reader.get('pid')==roles['runner'].get('pid') and 0<=time.time()-reader['at']<30 else False
+    return reader['pid'] if reader.get('pid')==roles['runner'].get('pid') and reader['at']>=since and 0<=time.time()-reader['at']<30 else False
+def stopped_channel():
+    v=api('supervisor')
+    roles={r['id']:r for r in v.get('children',[])}
+    return (v.get('kind')=='serverboot' and v.get('alive') is True
+            and roles.get('channel',{}).get('alive') is True and 'runner' in roles
+            and all(r.get('alive') is False for k,r in roles.items() if k!='channel')
+            and ctl('status')['stopped'] is True)
+
 try:
     sp.run([*compose,'up','-d','--build','helene'],cwd=root,env=env,check=True)
     # A real boot error must be reported immediately and remain diagnosable.
     print('native image',sp.check_output(['docker','image','inspect','nativearm-helene','--format','{{.Architecture}}'],text=True).strip(),flush=True)
     first=wait(alive)
-    who=api('state')['desk']['version'];assert who=='2.9.2' and ctl('status')['stopped'] is False
-    api('panic',{});wait(lambda:ctl('status')['stopped'])
+    state=api('state');who=state['desk']['version']
+    assert who=='2.9.2' and state['runner']['alive'] and ctl('status')['stopped'] is False, (who,state['level'])
+    api('panic',{});wait(stopped_channel)
     sp.run(['docker','restart','nativearm'],check=True,stdout=sp.DEVNULL)
-    assert wait(lambda:ctl('status')['stopped'])
+    assert wait(stopped_channel)
+    since=time.time()
     assert ctl('resume')['stopped'] is False
-    resumed=wait(alive)
+    resumed=wait(lambda:alive(since))
     (out/'result.json').write_text(json.dumps(dict(arch=platform.machine(),server=who,stop_survived_container_restart=True,explicit_resume=True,channel_and_runner=True,first_reader_pid=first,resumed_reader_pid=resumed)))
 except BaseException:
     print(sp.check_output(['docker','inspect','nativearm','--format','{{json .State}} {{json .Mounts}}'],text=True),flush=True)
